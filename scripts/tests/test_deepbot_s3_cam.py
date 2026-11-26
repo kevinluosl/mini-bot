@@ -719,7 +719,8 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertNotIn("SetConfigHint", source)
         self.assertIn("bool ShouldStartActivation() override { return true; }", source)
         self.assertIn("void OnActivationCode(const std::string& code", source)
-        self.assertIn("ShowNotification", source)
+        self.assertIn("display_->ShowPairingCode(code);", source)
+        self.assertNotIn("ShowNotification(code.c_str()", source)
         board_header = (ROOT / "main/boards/common/board.h").read_text(encoding="utf-8")
         self.assertIn("virtual void OnActivationCode(const std::string& code", board_header)
         application = (ROOT / "main/application.cc").read_text(encoding="utf-8")
@@ -771,6 +772,24 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIn("text_font()", eyes)
         oled = (ROOT / "main/display/oled_display.cc").read_text(encoding="utf-8")
         self.assertNotIn("CONFIG_BOARD_TYPE_", oled)
+
+    def test_pairing_code_replaces_brand_until_activation_finishes(self):
+        eyes = EYES_SOURCE.read_text(encoding="utf-8")
+        show = eyes.split("void DeepbotEyesDisplay::ShowPairingCode", 1)[1].split("\nvoid ", 1)[0]
+        render = eyes.split("void DeepbotEyesDisplay::UpdateStartupTextLocked", 1)[1].split("\nvoid ", 1)[0]
+        brand = eyes.split("void DeepbotEyesDisplay::ShowBrandText", 1)[1].split("\nvoid ", 1)[0]
+        mode = eyes.split("void DeepbotEyesDisplay::ApplyDisplayMode", 1)[1].split("\nvoid ", 1)[0]
+        self.assertIn('code.find_first_not_of("0123456789")', show)
+        self.assertIn('code.size() != 6', show)
+        self.assertLess(show.index('DisplayLockGuard'), show.index('std::memcpy(pairing_code_'))
+        self.assertIn('UpdateStartupTextLocked();', show)
+        self.assertIn('UpdateStartupTextLocked();', brand)
+        self.assertIn('lv_label_set_text(emotion_label_, pairing_code_);', render)
+        self.assertIn('lv_obj_center(emotion_label_);', render)
+        self.assertNotIn('ShowNotification', show)
+        clearing = mode.index("pairing_code_[0] = '\\0';")
+        self.assertLess(mode.index('if (eyes_mode) {'), clearing)
+        self.assertLess(clearing, mode.index('UpdateStartupTextLocked();', clearing))
 
     def test_one_class_per_source_file(self):
         for path in sorted(BOARD.glob("*.cc")) + sorted(BOARD.glob("*.h")):

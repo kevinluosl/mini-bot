@@ -15,6 +15,18 @@ class AudioPlaybackContractTests(unittest.TestCase):
         # 契约断言跟随实现位置，避免因重构而误报。
         cls.incoming = (ROOT / "main/application_incoming_json.cc").read_text()
 
+    def test_unbind_restart_is_scoped_to_the_pending_hello(self):
+        start = self.protocol.index('&& ReadId(root, "hello_id")) {')
+        end = self.protocol.index('} else if (udp_reconnect_needed_.load() || broker_disconnected_.load()) {', start)
+        retry = self.protocol[start:end]
+        self.assertIn('ReadId(root, "hello_id") == expected_hello_id_', retry)
+        self.assertIn('!broker_disconnected_.load()', retry)
+        self.assertIn('strcmp(command->valuestring, "reboot") == 0', retry)
+        self.assertIn('strcmp(reason->valuestring, "binding_revoked") == 0', retry)
+        self.assertLess(retry.index('expected_hello_id_ = 0;'), retry.index('on_json_(root);'))
+        self.assertLess(retry.index('CUSTOM_SERVER_DISCONNECTED_EVENT'), retry.index('on_json_(root);'))
+        self.assertIn('Schedule([this]() { Reboot(); });', self.incoming)
+
     def test_speaking_restores_original_wake_word_policy(self):
         handler = self.app.split("void Application::HandleStateChangedEvent()", 1)[1]
         block = handler.split("case kDeviceStateSpeaking:", 1)[1].split("case kDeviceStateNotifying:", 1)[0]

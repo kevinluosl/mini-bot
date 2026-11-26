@@ -225,6 +225,25 @@ void CustomServerAudio::HandleControl(const std::string& payload) {
         } else {
             ESP_LOGE(TAG, "MQTT hello 缺少 UDP 地址");
         }
+    } else if (cJSON_IsString(type) && strcmp(type->valuestring, "system") == 0 && ReadId(root, "hello_id")) {
+        // 只有匹配本次待完成握手的解绑通知可越过业务消息门控；迟到包不得重启已恢复的会话。
+        auto command = cJSON_GetObjectItem(root, "command");
+        auto reason = cJSON_GetObjectItem(root, "reason");
+        bool retry_activation = false;
+        {
+            std::lock_guard<std::mutex> handshake(hello_mutex_);
+            if (ReadId(root, "hello_id") == expected_hello_id_ && !broker_disconnected_.load() &&
+                cJSON_IsString(command) && strcmp(command->valuestring, "reboot") == 0 &&
+                cJSON_IsString(reason) && strcmp(reason->valuestring, "binding_revoked") == 0) {
+                expected_hello_id_ = 0;
+                retry_activation = true;
+            }
+        }
+        if (retry_activation && on_json_) {
+            // 先结束旧握手的等待，再让应用主循环走正常重启、OTA、显示码流程。
+            xEventGroupSetBits(hello_event_, CUSTOM_SERVER_DISCONNECTED_EVENT);
+            on_json_(root);
+        }
     } else if (udp_reconnect_needed_.load() || broker_disconnected_.load()) {
         // 握手期间不执行上一轮迟到的工具或播放控制。
     } else if (server_epoch_.load() && cJSON_IsString(cJSON_GetObjectItem(root, "session_id")) &&

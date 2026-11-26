@@ -7,6 +7,7 @@
 #include <lvgl.h>
 #include <atomic>
 #include <cstdint>
+#include <string_view>
 
 // 在原 OLED 界面上叠加眼睛；隐藏而不删除基类仍会访问的控件。
 class DeepbotEyesDisplay : public OledDisplay {
@@ -269,6 +270,8 @@ private:
     void ApplyDisplayMode(bool eyes_mode);
     // 屏幕底色设为黑（双色屏上不点亮的像素即黑色）
     void ApplyBlackBackground();
+    char pairing_code_[7] = {};  // 由显示锁保护，保留前导 0。
+    void UpdateStartupTextLocked();
     void ShowBrandText();
 
 public:
@@ -285,6 +288,7 @@ public:
     // 会用当前时间（如 "16:05"）调用本函数，字符串对不上 STANDBY，会被误判成
     // "非待机"从而退回默认 UI（小人与顶部 banner）。因此改为读取设备状态机。
     void SetStatus(const char* status) override;
+    void ShowPairingCode(std::string_view code);
 
     // 眼睛界面下聊天文字不显示；情绪则在本类内部用几何图形表达
     void SetChatMessage(const char* role, const char* content) override;

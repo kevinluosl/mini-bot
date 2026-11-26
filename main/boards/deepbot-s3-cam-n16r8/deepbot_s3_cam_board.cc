@@ -1138,12 +1138,9 @@ public:
 
     bool ShouldStartActivation() override { return true; }
 
-    // 框架收到 6 位注册码时回调。OLED 上用通知条显示，方便用户在控制台完成注册。
-    void OnActivationCode(const std::string& code, const std::string& message) override {
-        if (display_ == nullptr) return;
-        // 注册码是用户要照着输入的信息，单独一条通知最醒目。
-        display_->ShowNotification(code.c_str(), 30000);
-        ESP_LOGI(TAG, "注册码: %s (%s)", code.c_str(), message.c_str());
+    // 配对码是待绑定画面的主内容，不放在顶部会超时的通知栏。
+    void OnActivationCode(const std::string& code, const std::string& /*message*/) override {
+        if (display_ != nullptr) display_->ShowPairingCode(code);
     }
 
     void StartNetwork() override {

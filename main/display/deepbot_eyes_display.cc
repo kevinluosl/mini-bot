@@ -197,18 +197,38 @@ void DeepbotEyesDisplay::SetupUI() {
 }
 
 void DeepbotEyesDisplay::ShowBrandText() {
-    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
-    if (lvgl_theme == nullptr || lvgl_theme->text_font() == nullptr) return;
-
     DisplayLockGuard lock(this);
-    if (emotion_label_ == nullptr) return;
+    UpdateStartupTextLocked();
+}
+
+void DeepbotEyesDisplay::ShowPairingCode(std::string_view code) {
+    if (code.size() != 6 || code.find_first_not_of("0123456789") != std::string_view::npos) return;
+    DisplayLockGuard lock(this);
+    std::memcpy(pairing_code_, code.data(), code.size());
+    pairing_code_[6] = '\0';
+    // 配对是持续状态，不走会超时或被其他通知覆盖的状态栏。
+    UpdateStartupTextLocked();
+}
+
+void DeepbotEyesDisplay::UpdateStartupTextLocked() {
+    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    if (lvgl_theme == nullptr || lvgl_theme->text_font() == nullptr ||
+        emotion_label_ == nullptr || content_left_ == nullptr) return;
 
     lv_obj_set_width(content_left_, width_);
     if (content_right_ != nullptr) {
         lv_obj_add_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_set_style_text_font(emotion_label_, lvgl_theme->text_font()->font(), 0);
-    lv_label_set_text(emotion_label_, "mini-bot");
+    if (pairing_code_[0] != '\0') {
+        lv_obj_set_style_text_letter_space(emotion_label_, 3, 0);
+        lv_obj_set_style_text_color(emotion_label_, PixelOn(), 0);
+        lv_label_set_text(emotion_label_, pairing_code_);
+    } else {
+        lv_obj_remove_local_style_prop(emotion_label_, LV_STYLE_TEXT_LETTER_SPACE, 0);
+        lv_obj_remove_local_style_prop(emotion_label_, LV_STYLE_TEXT_COLOR, 0);
+        lv_label_set_text(emotion_label_, "mini-bot");
+    }
     lv_obj_center(emotion_label_);
 }
 
@@ -449,6 +469,11 @@ void DeepbotEyesDisplay::ApplyDisplayMode(bool eyes_mode) {
     if (eyes_mode) {
         // 眼睛模式：收起所有文字控件，只留黑底遮罩与眼睛
         if (container_ != nullptr) lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
+        if (pairing_code_[0] != '\0') {
+            // 激活结束才进入日常眼睛界面，同时清除隐藏文字里的配对码。
+            pairing_code_[0] = '\0';
+            UpdateStartupTextLocked();
+        }
         if (status_bar_ != nullptr) lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
         if (low_battery_popup_ != nullptr) lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
         if (bg_mask_ != nullptr) lv_obj_remove_flag(bg_mask_, LV_OBJ_FLAG_HIDDEN);
