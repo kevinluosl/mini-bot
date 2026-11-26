@@ -88,12 +88,27 @@ void Application::HandleIncomingJson(const cJSON* root) {
                 aborted_ = false;
                 pending_speaking_exit_ = kDeviceStateUnknown;
                 // 新一轮不继承旧轮收尾；是否保留已接受的效果由板端决定。
+                Board::GetInstance().SetMusicPlayback(false);
                 Board::GetInstance().OnNewUserTurn();
                 SetDeviceState(kDeviceStateSpeaking);
+            });
+        } else if (strcmp(state->valuestring, "music_start") == 0 ||
+                   strcmp(state->valuestring, "music_stop") == 0) {
+            if (!cJSON_IsString(cJSON_GetObjectItem(root, "session_id"))) return;
+            const auto generation = custom_server_audio_.ReplyGeneration();
+            if (!generation) return;
+            const bool active = strcmp(state->valuestring, "music_start") == 0;
+            Schedule([this, generation, active]() {
+                if (custom_server_audio_.ReplyGeneration() != generation) return;
+                if (!active || (!aborted_ && GetDeviceState() == kDeviceStateSpeaking &&
+                                pending_speaking_exit_ == kDeviceStateUnknown)) {
+                    Board::GetInstance().SetMusicPlayback(active);
+                }
             });
         } else if (strcmp(state->valuestring, "stop") == 0) {
             auto received_ms = esp_timer_get_time() / 1000;
             Schedule([this, received_ms]() {
+                Board::GetInstance().SetMusicPlayback(false);
                 auto state = GetDeviceState();
                 if (state == kDeviceStateSpeaking) {
                     // tts stop 只表示服务端已结束播报；工具的本地效果可能还在运行。
@@ -190,6 +205,25 @@ void Application::HandleIncomingJson(const cJSON* root) {
     } else if (strcmp(type->valuestring, "mcp") == 0) {
         auto payload = cJSON_GetObjectItem(root, "payload");
         auto session_id = cJSON_GetObjectItem(root, "session_id");
+        if (cJSON_IsTrue(cJSON_GetObjectItem(root, "music_accompaniment"))) {
+            // 伴奏仍使用 head.act 的动作名，但不走可排队的普通工具回调。
+            const auto method = cJSON_GetObjectItem(payload, "method");
+            const auto params = cJSON_GetObjectItem(payload, "params");
+            const auto name = cJSON_GetObjectItem(params, "name");
+            const auto args = cJSON_GetObjectItem(params, "arguments");
+            const auto action = cJSON_GetObjectItem(args, "action");
+            const auto generation = custom_server_audio_.ReplyGeneration();
+            if (generation && cJSON_IsString(session_id) && cJSON_IsString(method) && strcmp(method->valuestring, "tools/call") == 0 &&
+                cJSON_IsString(name) && strcmp(name->valuestring, "self.head.act") == 0 && cJSON_IsString(action)) {
+                Schedule([this, generation, action = std::string(action->valuestring)]() {
+                    if (custom_server_audio_.ReplyGeneration() == generation && !aborted_ &&
+                        GetDeviceState() == kDeviceStateSpeaking) {
+                        Board::GetInstance().TryMusicHeadAction(action);
+                    }
+                });
+            }
+            return;
+        }
         if (cJSON_IsObject(payload)) {
             // 部分 MCP 回包在 MQTT 收包回调内同步生成。先切到应用任务再发布，
             // 避免重连持发送锁等待 MQTT 回调退出，而回调又在等同一把锁。

@@ -254,7 +254,7 @@ bool BuildMotion(std::string_view action, int level, int from_pan, int from_tilt
     return true;
 }
 
-std::string HeadMotionPlayer::Enqueue(std::string_view action, int level) {
+std::string HeadMotionPlayer::Enqueue(std::string_view action, int level, bool show_emotion) {
     if (!IsValidAction(action)) {
         return "未知动作：" + std::string(action);
     }
@@ -268,7 +268,7 @@ std::string HeadMotionPlayer::Enqueue(std::string_view action, int level) {
         // 拒绝新动作而不是丢旧动作：模型连发太多时，先做完已排的更符合预期。
         return "动作队列已满（最多排 4 个），等当前动作做完再发";
     }
-    queue_.push_back({std::string(action), Clamp(level, 1, 2)});
+    queue_.push_back({std::string(action), Clamp(level, 1, 2), show_emotion});
     return "";
 }
 
@@ -299,6 +299,7 @@ bool HeadMotionPlayer::StartNext(int pan, int tilt) {
         if (posture && tilt != motion.frames.front().tilt) {
             motion.frames.front().speed = std::min(motion.frames.front().speed, kMid);
         }
+        if (!next.show_emotion) motion.emotion = nullptr;
         current_ = std::move(motion);
         active_ = true;
         frame_index_ = 0;

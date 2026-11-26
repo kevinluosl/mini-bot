@@ -62,6 +62,20 @@ int main() {
     }
     assert(!IsValidAction("spin") && IsValidAction("nod") && IsValidAction("stop"));
 
+    // 音乐伴奏走相同轨迹，但不发起短表情；之后的普通动作仍照常发起。
+    {
+        HeadMotionPlayer p(kLimits);
+        int pan = 90, tilt = 90;
+        const char* emotion = nullptr;
+        assert(p.Enqueue("nod", 1, false).empty());
+        assert(p.Enqueue("shake", 1).empty());
+        assert(p.Tick(20, pan, tilt, &emotion) && emotion == nullptr);
+        while (p.ActiveName() == "nod") {
+            assert(p.Tick(20, pan, tilt, &emotion) && emotion == nullptr);
+        }
+        assert(p.Tick(20, pan, tilt, &emotion) && emotion != nullptr);
+    }
+
     // 2) 左右看两档幅度加大，俯仰角度和斜向动作的共用速度不变。
     const int pan_deg[] = {40, 55}, up_deg[] = {35, 50}, down_deg[] = {30, 38};
     const int pan_speed[] = {125, 150};

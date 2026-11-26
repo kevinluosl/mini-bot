@@ -408,6 +408,7 @@ void Application::InitializeProtocol() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
+            Board::GetInstance().SetMusicPlayback(false);
             if (GetDeviceState() == kDeviceStateSpeaking) {
                 // 断开旧语音通道不取消已接受的本地动作。
                 pending_speaking_exit_ = kDeviceStateIdle;
@@ -648,7 +649,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
-    if (new_state != kDeviceStateSpeaking) pending_speaking_exit_ = kDeviceStateUnknown;
+    if (new_state != kDeviceStateSpeaking) {
+        pending_speaking_exit_ = kDeviceStateUnknown;
+        Board::GetInstance().SetMusicPlayback(false);
+    }
     if (new_state != kDeviceStateListening) CompleteServerListening(false);
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
@@ -838,6 +842,7 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    Board::GetInstance().SetMusicPlayback(false);
     // 打断说话时立即清空本地尚未播完的解码与播放队列
     audio_service_.ResetDecoder();
     custom_server_audio_.SendAbort();

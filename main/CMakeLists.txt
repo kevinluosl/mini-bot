@@ -25,6 +25,7 @@ set(SOURCES
     "display/text_glyph.cc"
     "display/oled_display.cc"
     "display/deepbot_eyes_display.cc"
+    "display/deepbot_eyes_music.cc"
     "display/lvgl_display/lvgl_display.cc"
     "display/lvgl_display/emoji_collection.cc"
     "display/lvgl_display/lvgl_theme.cc"

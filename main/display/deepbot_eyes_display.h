@@ -63,6 +63,7 @@ private:
     enum class EyeShape {
         kOval,     // 实心圆角矩形（默认；哭眼也用它，靠泪滴区分）
         kSmileArc, // 圆头粗 ∪ 弧（笑眼：happy）
+        kMusicNote,
     };
 
 
@@ -98,6 +99,7 @@ private:
         kCrying,    // 哭泣：闭得很小 + 抽泣颤动 + 下垂
         kFocus,     // 专注：用于看、张望和倾听
         kSurprised, // 惊讶：瞪圆双眼
+        kMusic,     // 播放期间锁定，不进短表情队列
     };
 
     // 情绪有效期：2 秒。
@@ -117,7 +119,10 @@ private:
     bool head_emotion_running_ = false;
     uint32_t head_emotion_until_tick_ = 0;
     bool touch_smile_ = false;  // 持显示锁访问，不进入工具表情队列。
+    bool music_playback_ = false;
+    uint32_t music_enter_tick_ = 0;
     EyeEmotion VisibleEmotion() const {
+        if (music_playback_) return EyeEmotion::kMusic;
         if (head_emotion_ != EyeEmotion::kNone) return head_emotion_;
         return emotion_ != EyeEmotion::kNone ? emotion_ : (touch_smile_ ? EyeEmotion::kHappy : EyeEmotion::kNone);
     }
@@ -239,6 +244,8 @@ private:
     static void EyeDrawCb(lv_event_t* e);
     // mirror=true 表示右眼：泪滴要画在右侧，与左眼镜像对称。
     void DrawEyeShape(lv_layer_t* layer, const lv_area_t& coords, EyeShape shape, bool mirror);
+    void AnimateMusicEyes();
+    void DrawMusicNote(lv_layer_t* layer, const lv_area_t& coords, bool right_eye);
 
     // 当前状态下的基础尺寸（未叠加眨眼）。
     //
@@ -295,6 +302,7 @@ public:
     void SetEmotion(const char* emotion) override;
     void SetConversationNeutral() override;
     void SetTouchSmile(bool enabled);
+    void SetMusicPlayback(bool active);
     void StartHeadActionEmotion(const char* emotion);
     void FinishHeadActionEmotion();
     bool HasPendingToolEmotion();

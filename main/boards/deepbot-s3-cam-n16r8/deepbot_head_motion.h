@@ -71,7 +71,7 @@ public:
 
     // 入队一个动作。返回空串表示成功，否则是给模型看的中文错误原因。
     // stop 立即清空旧动作，然后由播放器平滑回中，直到最后一拍才完成。
-    std::string Enqueue(std::string_view action, int level);
+    std::string Enqueue(std::string_view action, int level, bool show_emotion = true);
 
     // 清空队列、中止当前动作，并把静止朝向设为中位。
     void Stop();
@@ -94,6 +94,7 @@ private:
     struct Pending {
         std::string action;
         int level;
+        bool show_emotion = true;
     };
 
     bool StartNext(int pan, int tilt);

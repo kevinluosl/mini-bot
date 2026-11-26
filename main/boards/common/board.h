@@ -94,6 +94,8 @@ public:
     virtual bool HasPendingToolEffects() { return false; }
     // 提供合并动效工具的板型不再对外注册独立屏幕表情工具。
     virtual bool HasCombinedHeadEmotionTool() const { return false; }
+    virtual void SetMusicPlayback(bool active) { (void)active; }
+    virtual void TryMusicHeadAction(const std::string& action) { (void)action; }
     virtual NetworkInterface* GetNetwork() = 0;
     virtual void StartNetwork() = 0;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }

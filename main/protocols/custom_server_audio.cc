@@ -366,6 +366,7 @@ bool CustomServerAudio::SendHelloLocked(uint32_t hello_id) {
     cJSON_AddNumberToObject(root, "version", 3);
 #if CONFIG_BOARD_TYPE_DEEPBOT_S3_CAM_N16R8
     cJSON_AddBoolToObject(root, "proactive_listen", true);
+    cJSON_AddBoolToObject(root, "music_playback", true);
 #endif
     cJSON_AddNumberToObject(root, "hello_id", hello_id);
     cJSON_AddStringToObject(root, "transport", "udp");

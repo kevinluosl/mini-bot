@@ -638,6 +638,12 @@ void DeepbotEyesDisplay::OnAnimTick() {
         }
     }
 
+    // 音符独立律动，不参与普通表情的眨眼、视线和头部联动。
+    if (VisibleEmotion() == EyeEmotion::kMusic) {
+        AnimateMusicEyes();
+        return;
+    }
+
     // ================= 计算最终高度 =================
     //
     // 两道优先级：情绪 > 状态。
@@ -768,6 +774,7 @@ const char* DeepbotEyesDisplay::EmotionName(EyeEmotion emotion) {
         case EyeEmotion::kCrying:   return "crying";
         case EyeEmotion::kFocus:    return "focus";
         case EyeEmotion::kSurprised: return "surprised";
+        case EyeEmotion::kMusic:     return "music";
         case EyeEmotion::kNone:
         default:                    return "none";
     }
@@ -957,6 +964,11 @@ void DeepbotEyesDisplay::DrawEyeShape(lv_layer_t* layer, const lv_area_t& c,
     const int w = lv_area_get_width(&c);
     const int h = lv_area_get_height(&c);
     if (w <= 0 || h <= 0) return;
+
+    if (shape == EyeShape::kMusicNote) {
+        DrawMusicNote(layer, c, mirror);
+        return;
+    }
 
     // 哭眼：框内上方是抽噎的实心椭圆，下方是一滴下落的泪。
     // 单独处理而不走下面的 kOval 分支，因为框高（含泪水区）

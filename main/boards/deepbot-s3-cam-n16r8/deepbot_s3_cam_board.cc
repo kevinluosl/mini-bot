@@ -104,6 +104,8 @@ private:
         SERVO_CENTER_ANGLE - SERVO_1_MAX_OFFSET_DEG, SERVO_CENTER_ANGLE + SERVO_1_MAX_OFFSET_DEG,
         SERVO_CENTER_ANGLE - SERVO_2_MAX_OFFSET_UP_DEG, SERVO_CENTER_ANGLE + SERVO_2_MAX_OFFSET_DOWN_DEG}};
     SemaphoreHandle_t head_motion_mutex_ = xSemaphoreCreateMutex();
+    bool music_playback_ = false;  // 与播放器共用互斥；停止时丢弃尚未开始的伴奏。
+    std::string pending_music_action_;
     bool head_final_output_pending_ = false;  // 与播放器共用互斥；最后一拍写入 PWM 后才清除。
 
     // 传感器反应任务句柄（触摸 / 红外）。
@@ -792,6 +794,13 @@ private:
                 int pan = servo1_angle_;
                 int tilt = servo2_angle_;
                 xSemaphoreTake(head_motion_mutex_, portMAX_DELAY);
+                if (!pending_music_action_.empty()) {
+                    if (music_playback_ && !head_motion_.Busy() && !head_final_output_pending_) {
+                        // 不生成伴奏表情，避免末拍跨过音乐停止时闪出另一张脸。
+                        head_motion_.Enqueue(pending_music_action_, 1, /*show_emotion=*/false);
+                    }
+                    pending_music_action_.clear();
+                }
                 motion_active = head_motion_.Tick(kTickMs, pan, tilt, &started_emotion);
                 finishing = motion_active && !head_motion_.Busy();
                 head_final_output_pending_ = finishing;
@@ -1085,6 +1094,26 @@ private:
 
 public:
     bool HasCombinedHeadEmotionTool() const override { return true; }
+
+    void SetMusicPlayback(bool active) override {
+        if (head_motion_mutex_ != nullptr) {
+            xSemaphoreTake(head_motion_mutex_, portMAX_DELAY);
+            music_playback_ = active;
+            if (!active) pending_music_action_.clear();
+            xSemaphoreGive(head_motion_mutex_);
+        }
+        if (display_ != nullptr) display_->SetMusicPlayback(active);
+    }
+
+    void TryMusicHeadAction(const std::string& action) override {
+        if (!servos_ready_ || head_motion_mutex_ == nullptr || sensor_task_ == nullptr) return;
+        if (action != "nod" && action != "shake" && action != "dance") return;
+        xSemaphoreTake(head_motion_mutex_, portMAX_DELAY);
+        // 单拍交接槽，不排队；普通工具若先占用播放器，下拍也会丢掉伴奏。
+        if (music_playback_ && pending_music_action_.empty() &&
+            !head_motion_.Busy() && !head_final_output_pending_) pending_music_action_ = action;
+        xSemaphoreGive(head_motion_mutex_);
+    }
 
     bool HasPendingToolEffects() override {
         if (head_motion_mutex_ != nullptr) {
