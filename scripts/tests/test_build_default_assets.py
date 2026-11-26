@@ -79,7 +79,7 @@ class BuildDefaultAssetsTest(unittest.TestCase):
 
     def test_wakenet10_copy_keeps_s3_p1_slice(self):
         with tempfile.TemporaryDirectory() as directory:
-            src = Path(directory) / "wn10_nihaoxiaozhi"
+            src = Path(directory) / "wn10_mini_bot_fixture"
             dst = Path(directory) / "out"
             src.mkdir()
             (src / "_MODEL_INFO_p1").write_text("p1-info", encoding="utf-8")
@@ -97,7 +97,7 @@ class BuildDefaultAssetsTest(unittest.TestCase):
 
     def test_wakenet10_copy_keeps_p4_p2_slice(self):
         with tempfile.TemporaryDirectory() as directory:
-            src = Path(directory) / "wn10_nihaoxiaozhi"
+            src = Path(directory) / "wn10_mini_bot_fixture"
             dst = Path(directory) / "out"
             src.mkdir()
             (src / "_MODEL_INFO_p2").write_text("p2-info", encoding="utf-8")
@@ -109,7 +109,7 @@ class BuildDefaultAssetsTest(unittest.TestCase):
 
     def test_wakenet10_copy_rejects_unknown_target(self):
         with tempfile.TemporaryDirectory() as directory:
-            src = Path(directory) / "wn10_nihaoxiaozhi"
+            src = Path(directory) / "wn10_mini_bot_fixture"
             src.mkdir()
             (src / "wn10_data_p1").write_bytes(b"s3-data")
             with self.assertRaises(ValueError):
