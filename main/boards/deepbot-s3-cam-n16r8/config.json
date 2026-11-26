@@ -1,0 +1,18 @@
+{
+    "type": "deepbot-s3-cam-n16r8",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "deepbot-s3-cam-n16r8",
+            "sdkconfig_append": [
+                "CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO=n",
+                "CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM=y",
+                "CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE=524288",
+                "CONFIG_CAMERA_PSRAM_DMA=n",
+                "CONFIG_SEND_WAKE_WORD_DATA=n",
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_OTA_URL=\"http://43.142.28.216:8765/deepbot/ota/\""
+            ]
+        }
+    ]
+}

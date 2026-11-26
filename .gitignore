@@ -1,0 +1,11 @@
+build/
+sdkconfig
+sdkconfig.old
+__pycache__/
+*.pyc
+main/assets/lang_config.h
+managed_components/
+sdkconfig.local.defaults
+.env
+.env.*
+.DS_Store

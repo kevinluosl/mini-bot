@@ -1,0 +1,128 @@
+menu "Mini-Bot"
+
+config MINI_BOT_OV_BASE_URL
+    string "OV vision gateway base URL"
+    default ""
+    help
+        Leave empty to disable cloud observation until a gateway is configured.
+
+config OTA_URL
+    string "Default OTA URL"
+    default "http://43.142.28.216:8765/deepbot/ota/"
+    help
+        The application will access this URL to check for new firmwares and server address.
+
+choice
+    prompt "Flash Assets"
+    default FLASH_DEFAULT_ASSETS
+    help
+        Select the assets to flash.
+
+    config FLASH_NONE_ASSETS
+        bool "Do not flash assets"
+    config FLASH_DEFAULT_ASSETS
+        bool "Flash Default Assets"
+    config FLASH_CUSTOM_ASSETS
+        bool "Flash Custom Assets"
+endchoice
+
+config CUSTOM_ASSETS_FILE
+    depends on FLASH_CUSTOM_ASSETS
+    string "Custom Assets File"
+    default "assets.bin"
+    help
+        The custom assets file to flash.
+        It can be a local file relative to the project directory or a remote url.
+
+choice
+    prompt "Default Language"
+    default LANGUAGE_ZH_CN
+    config LANGUAGE_ZH_CN
+        bool "Chinese"
+endchoice
+
+choice BOARD_TYPE
+    prompt "Target Board"
+    default BOARD_TYPE_DEEPBOT_S3_CAM_N16R8
+    config BOARD_TYPE_DEEPBOT_S3_CAM_N16R8
+        bool "ESP32-S3-CAM N16R8"
+        depends on IDF_TARGET_ESP32S3
+endchoice
+
+choice WAKE_WORD_TYPE
+    prompt "Wake Word Implementation Type"
+    default USE_AFE_WAKE_WORD if SPIRAM
+    default WAKE_WORD_DISABLED
+
+    config WAKE_WORD_DISABLED
+        bool "Disabled"
+    config USE_AFE_WAKE_WORD
+        bool "Wakenet model with AFE"
+        depends on SPIRAM
+    config USE_CUSTOM_WAKE_WORD
+        bool "Multinet model (Custom Wake Word)"
+        depends on SPIRAM
+endchoice
+
+config CUSTOM_WAKE_WORD
+    string "Custom Wake Word"
+    default "xiao tu dou"
+    depends on USE_CUSTOM_WAKE_WORD
+
+config CUSTOM_WAKE_WORD_DISPLAY
+    string "Custom Wake Word Display"
+    default "小土豆"
+    depends on USE_CUSTOM_WAKE_WORD
+
+config CUSTOM_WAKE_WORD_THRESHOLD
+    int "Custom Wake Word Threshold (%)"
+    default 20
+    range 1 99
+    depends on USE_CUSTOM_WAKE_WORD
+
+# cam 板默认不上传唤醒词音频，否则会跳过本地唤醒提示音。
+config SEND_WAKE_WORD_DATA
+    bool "Send Wake Word Data"
+    default n
+    depends on USE_AFE_WAKE_WORD || USE_CUSTOM_WAKE_WORD
+
+config WAKE_WORD_DETECTION_IN_LISTENING
+    bool "Enable Wake Word Detection in Listening Mode"
+    default n
+    depends on USE_AFE_WAKE_WORD || USE_CUSTOM_WAKE_WORD
+
+config USE_AUDIO_PROCESSOR
+    bool "Enable AFE Audio Processing"
+    default y
+    depends on SPIRAM
+
+# cam 板由 NoAudioCodecSimplexAec 软件回采播放信号，默认开启设备端 AEC，
+# 否则播放中无法打断。
+config USE_DEVICE_AEC
+    bool "Enable Device-Side AEC"
+    default y
+    depends on USE_AUDIO_PROCESSOR
+
+config USE_SERVER_AEC
+    bool "Enable Server-Side AEC (Unstable)"
+    default n
+    depends on USE_AUDIO_PROCESSOR
+
+config USE_AUDIO_DEBUGGER
+    bool "Enable Audio Debugger"
+    default n
+
+config AUDIO_DEBUG_UDP_SERVER
+    string "Audio Debug UDP Server Address"
+    default "192.168.2.100:8000"
+    depends on USE_AUDIO_DEBUGGER
+
+config USE_HOTSPOT_WIFI_PROVISIONING
+    bool "Hotspot WiFi provisioning"
+    default y
+
+config RECEIVE_CUSTOM_MESSAGE
+    bool "Enable Custom Message Reception"
+    default n
+
+endmenu
