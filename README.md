@@ -1,5 +1,7 @@
 # mini-bot
 
+<img src="docs/images/mini-bot-logo.png" alt="mini-bot Logo" width="700">
+
 **一台用 ESP32-S3 驱动的小机器人，一个把 LLaVA-OneVision-2.5 接进真实世界的实验。**
 
 mini-bot 想回答两个问题：ESP32 能否作为一台桌面机器人的基础硬件，长期稳定地连接云端「大脑」？给机器人一只摄像头之后，[LLaVA-OneVision-2.5](https://github.com/EvolvingLMMs-Lab/LLaVA-OneVision-2.5) 能在真实互动里看懂多少，又会在哪些场景出错？这不是成品机器人，而是一个持续试验语音、视觉和动作如何配合的项目。
@@ -9,6 +11,14 @@ mini-bot 想回答两个问题：ESP32 能否作为一台桌面机器人的基�
 扬声器 / OLED / 舵机 ────┘                 │
 摄像头 ────────── ESP32-S3 ── 视觉网关 / LLaVA-OV-2.5
 ```
+
+## 基础演示
+
+**01 · mini-bot 实机演示**（约 42 秒）
+
+<a href="https://github.com/kevinluosl/mini-bot/raw/refs/heads/main/docs/demos/basic-demo-01.mp4"><img src="docs/images/basic-demo-01.jpg" alt="mini-bot 基础演示 01 视频封面" width="240"></a>
+
+[观看或下载 MP4](https://github.com/kevinluosl/mini-bot/raw/refs/heads/main/docs/demos/basic-demo-01.mp4)
 
 ## 重点实验：LLaVA-OV-2.5 视觉
 
