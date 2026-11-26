@@ -1,50 +1,32 @@
-# mini-bot 服务器接口说明
+# mini-bot 设备接入指南
 
-本仓库只包含固件。本文说明如何连接配套服务器，以及怎样通过后台 HTTP API 管理自己的设备；不包含服务端源码或任何凭据。
+把 mini-bot 接入平台后，可用已绑定设备体验语音对话和板载功能。本文只说明设备接入；已使用本仓库固件的用户无需手动调用接口。
 
-- [在线接口说明](http://43.142.28.216:8765/api-reference)：完整接口、字段、权限、状态码和调用示例。自建服务器使用对应基址下的 `/api-reference`。
-- `/admin`：设备控制台；也可在右上角账号菜单打开「接口说明」。
-- `/docs`、`/openapi.json`：Swagger 和机器可读的接口目录；手动读取的 JSON 字段以在线说明为准。
+## 接入步骤
 
-> 测试服务当前支持 HTTP，链路不加密。请在可信网络或 SSH 隧道中发送密码、会话 Cookie、配对码和 Key。文中的地址、字段名不代表已有访问授权。
+1. 扫码加入 [README 中的开发者交流群](../README.md#机器人测试服务与开发者群)，在群内领取 mini-bot 测试账号。控制台地址为 `http://43.142.28.216:8765/admin`。
+2. 本仓库固件默认使用 `http://43.142.28.216:8765/deepbot/ota/`。自行编译并接入其他实例时，可在仓库根目录的 `sdkconfig.local.defaults` 中设置 `CONFIG_OTA_URL`，填入该实例的完整 OTA 地址并保留 `/deepbot/ota/` 结尾。如果已构建过，先备份并移开旧的 `sdkconfig`，再按 README 重新构建。不要填控制台或 OV 视觉网关地址。
+3. 给设备配好 Wi-Fi。未绑定的板子联网后会在 OLED 中央显示并播报六位配对码。
+4. 用测试账号登录[设备控制台](http://43.142.28.216:8765/admin)，从右上角账号菜单进入「绑定设备」，输入当前六位码（保留前导零）。配对码只能使用一次，有效期 10 分钟。
+5. 等待板子自动完成激活，在控制台确认设备显示「在线」。
 
-## 固件接入
+## 固件对接所需接口
 
-固件的 OTA 基址由 `CONFIG_OTA_URL` 配置，测试服务使用 `/deepbot/ota/`。不要把外部 OV 视觉网关地址填为 OTA 地址。
+以下 HTTP 路径相对于平台基址。固件发送 `Device-Id`（设备自身的小写冒号分隔 MAC）和 `Client-Id`（设备持久 UUID，重启不变）。
 
-| 阶段 | 接口 / 通道 | 说明 |
-| --- | --- | --- |
-| 检查版本与登记 | `GET` / `POST /deepbot/ota/` | 固件发送 `Device-Id`（小写、冒号分隔的 MAC）和 `Client-Id`（板端持久 UUID）。待绑定时返回 `activation`；已绑定时返回 `mqtt`。
-| 账号绑定 | 控制台 `/admin/bind` | 用户输入 OLED 显示或扬声器播报的六位码。首次登记但未绑定的设备不出现在后台列表。一次性码有效期 10 分钟。
-| 激活确认 | `POST /deepbot/ota/activate` | 固件核对激活状态：`202` / `pending` 表示仍待绑定，`200` / `ok` 表示激活完成。随后重新请求 OTA 取得 MQTT 配置。
-| 控制与工具 | MQTT | 使用 OTA 返回的连接参数和主题。`hello` 建立会话，控制事件和 MCP 工具消息通过 MQTT 收发。
-| 语音 | UDP | 使用握手协商的端点交换 Opus 音频，不走 HTTP；音频首包用于建立 UDP 对端。
-
-设备解绑后会重新进入配对流程；如果错过在线通知，兼容固件会在下一次握手时处理补发。不要通过清除 NVS 来刷新配对码：清除 NVS 可能改变板端持久 UUID，需要服务端核验登记身份。板端 UUID 校验不是出厂硬件身份认证。请勿公开板端 UUID、激活响应、配对码或 MQTT 凭据。
-
-## 后台常用 HTTP API
-
-先向 `POST /api/auth/login` 提交 JSON `username` 和 `password`，后续携带响应设置的 `mini_bot_session` Cookie。首次登录或管理员重置密码后，须先通过 `POST /api/auth/password` 完成密码设置；否则业务接口会返回 `428`。浏览器写请求须同源。管理员也只能管理自己账号的设备。
-
-| 方法与路径 | 用途 |
+| 接口或通道 | 用途 |
 | --- | --- |
-| `GET /api/auth/me` | 查询当前账号及是否需要改密 |
-| `GET /api/devices` | 列出当前账号的设备（含已解绑记录），使用 `bound` 和 `online` 判断状态 |
-| `POST /api/devices/bind` | 提交 JSON `code`（六位数字字符串），可选 `name` |
-| `GET /api/devices/{device_id}/chats` | 读取近期聊天；原账号也可读已解绑设备的历史 |
-| `GET /api/config?device_id=…` | 读取音色和提示词 |
-| `POST /api/config` | 提交 `device_id`、要修改的 `tts_voice`、`system_prompt` 或 `role_prompt`；空音色跟随平台默认 |
-| `GET /api/devices/{device_id}/tools` | 查询设备与云端工具目录，不执行工具 |
-| `GET /api/devices/{device_id}/scheduled-tasks` | 列出定时任务和可用工具 |
-| `POST /api/devices/{device_id}/unbind` | 解除绑定，保留配置与历史；跨账号换绑时会清除前任的聊天、记忆和任务 |
-| `DELETE /api/devices/{device_id}` | 删除设备及其记录，不能恢复；不影响平台模型 Key |
+| `POST /deepbot/ota/`（无系统信息时用 `GET`） | 联网后检查版本并登记设备；POST 携带系统信息 JSON。成功返回 `200`；未绑定读取 `activation.code`，已绑定使用响应中的 `mqtt` 配置。 |
+| `POST /deepbot/ota/activate` | 收到激活信息后沿用同一设备标识轮询，常规 mini-bot 发送 JSON `{}`。`202` / `pending` 继续等待用户绑定，`200` / `ok` 后再次请求 OTA 获取连接配置。 |
+| MQTT | 按 OTA 下发的参数建立会话，交换控制和设备工具消息。 |
+| UDP | 使用会话协商的通道传输 Opus 语音；不用另填固定端口。 |
 
-只读示例：在已登录且已完成改密的同源控制台中调用：
+## 功能验收与排查
 
-```js
-const response = await fetch('/api/devices');
-if (!response.ok) throw new Error(`HTTP ${response.status}`);
-const { devices } = await response.json();
-```
+用设备配置的唤醒词唤醒机器人，说一句「你好」，确认能听到回复。支持头部动作的设备也可试说「点点头」。OV 视觉网关另有地址和授权，不是语音接入的前置条件。
 
-平台模型、用户管理、永久记忆、云端工具及定时任务的完整调用约定见[在线接口说明](http://43.142.28.216:8765/api-reference)。OV 视觉实验使用独立网关，授权和连接方式以开发者群内说明为准。
+- 没看到配对码：先确认 Wi-Fi 和 OTA 地址；已绑定的设备正常上线时不显示配对码。
+- 码过期：重新联网或重启板子刷新，不要恢复出厂设置；恢复出厂可能改变持久设备标识。
+- 绑定后不在线：先检查设备所在网络；在线却没有语音时，确认网络允许使用协商的 UDP 通道。
+
+请勿公开测试账号、板端 UUID、配对码或原始 OTA 响应。测试地址若是 HTTP，仅在可信网络中使用。在线接入指南可从设备控制台右上角打开。
