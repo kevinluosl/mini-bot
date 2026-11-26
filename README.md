@@ -1,6 +1,6 @@
-# mini-bot
-
-<img src="docs/images/mini-bot-logo.png" alt="mini-bot Logo" width="700">
+<p align="center">
+  <img src="docs/images/mini-bot-logo.png" alt="mini-bot Logo" width="700">
+</p>
 
 **一台用 ESP32-S3 驱动的小机器人，一个把 LLaVA-OneVision-2.5 接进真实世界的实验。**
 
@@ -22,7 +22,7 @@ mini-bot 想回答两个问题：ESP32 能否作为一台桌面机器人的基�
 
 ## 重点实验：LLaVA-OV-2.5 视觉
 
-OV-2.5 不在 ESP32 上运行。固件在开启观察后持续采集 JPEG，以约每秒一帧的频率送给视觉网关。**持续观察不等于持续解说**：只有提问才请求回答，结束观察后停止上传并关闭会话。
+OV-2.5 不在 ESP32 上运行。开启观察后，当前项目以 **1 帧/秒**向视觉网关发送 JPEG 图像；视觉网关最高支持 **30 帧/秒**。**持续观察不等于持续解说**：只有提问才请求回答，结束观察后停止上传并关闭会话。
 
 | 能力 | 实验方式 |
 | --- | --- |
