@@ -134,6 +134,13 @@ std::string_view TextField(const cJSON* item, const char* key) {
     return value ? value : "";
 }
 
+bool IsAnswerError(std::string_view status) {
+    return status == "insufficient_evidence" || status == "busy" || status == "stream_unavailable" ||
+           status == "vision_timeout" || status == "vision_queue_timeout" ||
+           status == "vision_release_unconfirmed" || status == "clarification" ||
+           status == "ambiguous_reference" || status == "invalid_visual_format";
+}
+
 bool HasValidEvidence(const cJSON* item, double frame_t, double question_t, std::string_view type,
                       bool from_results) {
     const auto source = ReadEvidenceWindow(item, "source_window_s");
@@ -289,29 +296,29 @@ void OvCameraWatcher::RunLoop() {
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
+    constexpr int64_t kPollIntervalUs = 250000;
     int64_t start_us = esp_timer_get_time();
+    int64_t next_frame_us = start_us, next_poll_us = 0;
     std::shared_ptr<ViewRequest> active;
     AnswerMatch match{};
-    int logs_after = 0;
+    int logs_after = 0, result_after = 0;
     int consecutive_failures = 0;
-    unsigned uploaded_frames = 0;
+    std::optional<double> latest_frame;
     bool stream_lost = false;
     int64_t last_heap_log_us = 0;
     while (watching_) {
-        const int64_t loop_start_us = esp_timer_get_time();
-        if (!last_heap_log_us || loop_start_us - last_heap_log_us >= kHeapLogIntervalUs) {
+        const int64_t now_us = esp_timer_get_time();
+        if (!last_heap_log_us || now_us - last_heap_log_us >= kHeapLogIntervalUs) {
             LogWatchHeap();
-            last_heap_log_us = loop_start_us;
+            last_heap_log_us = now_us;
         }
         std::shared_ptr<ViewRequest> requested;
         {
             std::lock_guard<std::mutex> guard(request_mutex_);
             requested = pending_;
         }
-        // 已发出但超时/未确认的请求可能迟到；保留现有的换会话隔离策略。
-        // 流式会话失效后同一会话的回看会一直报 stream_unavailable，也须换新会话才能恢复。
+        // 不确定网关是否已收到的提问仍可能迟到。先换会话，再接新问题。
         if ((active && active != requested) || stream_lost) {
-            if (stream_lost) ESP_LOGW(kTag, "流式会话不可用，重建 OV 会话");
             stream_lost = false;
             CloseSession();
             if (!watching_ || !OpenSession()) {
@@ -319,66 +326,73 @@ void OvCameraWatcher::RunLoop() {
                 break;
             }
             active.reset();
-            logs_after = 0;
-            uploaded_frames = 0;
-            start_us = esp_timer_get_time();
-        }
-        auto frame = PushOneFrame(start_us);
-        if (!frame) {
-            ESP_LOGW(kTag, "本轮失败: %s", frame.error().c_str());
-            if (++consecutive_failures >= kMaxFailures) {
-                ESP_LOGE(kTag, "连续 %d 次推帧失败，停止观察", consecutive_failures);
-                watching_ = false;
-                break;
-            }
-        } else {
-            consecutive_failures = 0;
-            if (frame->has_value()) {
-                ++uploaded_frames;
-                if (uploaded_frames == 1 || requested || active) {
-                    ESP_LOGI(kTag, "OV frame acknowledged seq=%u t=%.6f", uploaded_frames, **frame);
-                }
-            }
+            logs_after = result_after = consecutive_failures = 0;
+            latest_frame.reset();
+            start_us = next_frame_us = esp_timer_get_time();
         }
 
-        // 无在途问题时只推帧；有问题时先验证问答归属，不消费其他回答。
-        if (active && watching_ && std::chrono::steady_clock::now() < active->deadline) {
-            auto answer = CollectResults(logs_after, match);
+        const auto submit = [&](double frame_t) {
+            {
+                std::lock_guard<std::mutex> guard(request_mutex_);
+                if (!watching_ || !requested || active || pending_ != requested ||
+                    std::chrono::steady_clock::now() >= requested->deadline) return;
+                active = requested;
+            }
+            match = {(esp_timer_get_time() - start_us) / 1000000.0, frame_t, requested->current_only};
+            if (auto r = SendQuestion(active->question, match.question_t, active->time_scope); !r) {
+                // 保留 active，等待线程收到错误后，下一次循环隔离旧会话。
+                FinishView(active, "发送画面问题失败：" + r.error(), "");
+            }
+            next_poll_us = esp_timer_get_time();
+        };
+        const auto poll = [&](bool current) {
+            if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;
+            auto answer = current ? CollectCurrentResult(result_after, match) : CollectResults(logs_after, match);
+            next_poll_us = esp_timer_get_time() + kPollIntervalUs;
             if (!answer) {
                 ESP_LOGW(kTag, "OV 拉取结果失败: %s", answer.error().c_str());
             } else if (!answer->empty() && FinishView(active, *answer, match.status)) {
-                ESP_LOGI(kTag, "OV answer verified question_log_seq=%d seq=%d", match.question_log_seq, match.result_seq);
-                AddAnswer(*answer);
-                // 下一拍开头重建会话；active 已完成，不会把迟到的旧回答误算给新问题。
+                if (match.result_seq > result_after) result_after = match.result_seq;
+                ESP_LOGI(kTag, "OV answer seq=%d elapsed_ms=%lld", match.result_seq,
+                         static_cast<long long>((esp_timer_get_time() - start_us) / 1000 - match.question_t * 1000));
+                if (match.status == "ok") AddAnswer(*answer);
                 stream_lost = match.status == "stream_unavailable";
                 active.reset();
             }
-        }
-        // 只使用本轮正常采样确认的新帧。采样途中到来的问题等下一帧。
-        bool submit = false;
-        if (requested && !active && frame && frame->has_value() && watching_) {
-            // 已响应的 requested 是本轮的快照，不能再发一次；加锁后释放再做网络 I/O。
-            std::lock_guard<std::mutex> guard(request_mutex_);
-            if (pending_ == requested && std::chrono::steady_clock::now() < requested->deadline) {
-                active = requested;
-                match = {(esp_timer_get_time() - start_us) / 1000000.0, **frame, requested->current_only};
-                submit = true;
+        };
+        // 已有被接受的画面时优先提交 current；下一帧仍按自己的节拍上传。
+        const bool wants_current = requested && requested->time_scope == "current";
+        if (!active && wants_current && latest_frame) submit(*latest_frame);
+        // 用独立的短轮询节拍取答，不使用会卡住推帧的长轮询。
+        if (active && active == requested && active->time_scope == "current" &&
+            esp_timer_get_time() >= next_poll_us) {
+            // 提交失败会清掉 pending；不要再查可能已进入旧会话的结果。
+            bool still_pending;
+            {
+                std::lock_guard<std::mutex> guard(request_mutex_);
+                still_pending = pending_ == active;
             }
+            if (still_pending) poll(true);
         }
-        if (submit) {
-            if (auto r = SendQuestion(active->question, match.question_t, active->time_scope); !r) {
-                // 失败也可能已抵达网关；保留 active 供下一拍关闭旧会话。
-                FinishView(active, "发送画面问题失败：" + r.error(), "");
+        if (watching_ && !stream_lost && esp_timer_get_time() >= next_frame_us) {
+            next_frame_us = esp_timer_get_time() + kFrameIntervalMs * 1000LL;
+            auto frame = PushOneFrame(start_us);
+            if (!frame) {
+                ESP_LOGW(kTag, "本轮失败: %s", frame.error().c_str());
+                if (++consecutive_failures >= kMaxFailures) {
+                    watching_ = false;
+                    break;
+                }
+            } else {
+                consecutive_failures = 0;
+                if (frame->has_value()) latest_frame = **frame;
             }
+            if (active && active == requested && active->time_scope != "current") poll(false);
+            if (!active && requested && frame && frame->has_value()) submit(**frame);
         }
-
-        // ---- 3. 补齐到固定周期 ----
-        // 用已耗时反算剩余等待，避免"处理慢 + 固定 delay"导致周期变成 2 秒。
-        const int64_t elapsed_ms = (esp_timer_get_time() - loop_start_us) / 1000;
-        const int64_t remain_ms = kFrameIntervalMs - elapsed_ms;
-        if (remain_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS(remain_ms));
-        }
+        int64_t wake_us = next_frame_us;
+        if (active && active->time_scope == "current" && next_poll_us < wake_us) wake_us = next_poll_us;
+        if (!stream_lost) WaitForWork(requested, wake_us);
     }
 
     {
@@ -466,23 +480,29 @@ std::string OvCameraWatcher::GetView(const std::string& question, const std::str
     return RequestView(question, false, IsValidTimeScope(time_scope) ? time_scope : "current", deadline).text;
 }
 
-std::expected<std::string, std::string> OvCameraWatcher::LookCurrent(const std::string& question) {
+std::expected<std::string, std::string> OvCameraWatcher::LookCurrent(const std::string& question,
+                                                                     std::string* session_id) {
     // 缺省或空白沿用本工具的默认问题；明确提供的提示词原样传给 OV。
     if (question.find_first_not_of(" \t\r\n") == std::string::npos) {
-        return LookOnce(kLookCurrentQuestion, "current");
+        return LookOnce(kLookCurrentQuestion, "current", session_id);
     }
-    return LookOnce(question, "current");
+    return LookOnce(question, "current", session_id);
 }
 
 std::expected<std::string, std::string> OvCameraWatcher::LookPast() {
     return LookOnce(kLookPastQuestion, "past");
 }
 
-std::expected<std::string, std::string> OvCameraWatcher::LookOnce(const std::string& question, const char* time_scope) {
+std::expected<std::string, std::string> OvCameraWatcher::LookOnce(const std::string& question, const char* time_scope,
+                                                                  std::string* session_id) {
+    if (session_id) session_id->clear();
     // 实时优先：一次 look 只向 OV 提一个问题，最多等 20 秒。
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kViewTimeoutSec);
     auto reply = RequestView(question, false, time_scope, deadline);
-    if (reply.status == "ok") return std::move(reply.text);
+    if (reply.status == "ok") {
+        if (session_id) *session_id = std::move(reply.session_id);
+        return std::move(reply.text);
+    }
     // 非 ok 一律当工具错误，服务端不会拿它判断有人无人，也不会当成画面线索接话。
     if (reply.status == "stream_unavailable") return std::unexpected(kLookStreamLost);
     return std::unexpected(reply.text.empty() ? "没拿到画面" : reply.text);
@@ -500,21 +520,36 @@ OvCameraWatcher::ViewReply OvCameraWatcher::RequestView(const std::string& quest
     request->time_scope = time_scope;
     request->question = question.find_first_not_of(" \t\r\n") == std::string::npos ? kDefaultQuestion : question;
     pending_ = request;
-    // HTTP 由采样任务负责；即使一次网络请求卡住，工具也不叠加 HTTP 超时。
+    request_cv_.notify_all();  // 唤醒观察任务，不等下一次推帧。
     request_cv_.wait_until(lock, deadline, [&] { return pending_ != request || !watching_; });
-    if (pending_ == request) pending_.reset();
-    if (!request->reply.empty()) return {request->reply, request->status};
+    if (pending_ == request) {
+        pending_.reset();
+        request_cv_.notify_all();  // 观察任务发现超时后隔离旧会话。
+    }
+    if (!request->reply.empty()) return {request->reply, request->status, request->session_id};
     return {watching_ ? std::to_string(kViewTimeoutSec) + " 秒内未收到本次问题的画面描述"
                       : "摄像头已停止观察",
             ""};
 }
 
+void OvCameraWatcher::WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us) {
+    std::unique_lock<std::mutex> lock(request_mutex_);
+    request_cv_.wait_for(lock, std::chrono::microseconds(wake_us - esp_timer_get_time()),
+                        [&] { return pending_ != snapshot || !watching_; });
+}
+
 bool OvCameraWatcher::FinishView(const std::shared_ptr<ViewRequest>& request, const std::string& reply,
                                  const std::string& status) {
+    std::string sid;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        sid = session_id_;
+    }
     std::lock_guard<std::mutex> guard(request_mutex_);
     if (pending_ != request || !watching_ || std::chrono::steady_clock::now() >= request->deadline) return false;
     request->reply = reply;
     request->status = status;
+    request->session_id = std::move(sid);  // 与答案一并交付，不能事后读取可能已重建的会话。
     pending_.reset();
     request_cv_.notify_all();
     return true;
@@ -646,16 +681,52 @@ std::expected<std::string, std::string> OvCameraWatcher::SelectAnswer(const std:
             if (HasValidEvidence(item, match.frame_t, match.question_t, match.task_template, true)) {
                 return std::string(text);
             }
-        } else if (match.status == "insufficient_evidence" || match.status == "busy" ||
-                   // 流式会话失效时立即返回并重建会话，不空等到超时。
-                   match.status == "stream_unavailable" ||
-                   match.status == "vision_timeout" || match.status == "vision_queue_timeout" ||
-                   match.status == "vision_release_unconfirmed" || match.status == "clarification" ||
-                   match.status == "ambiguous_reference" || match.status == "invalid_visual_format") {
+        } else if (IsAnswerError(match.status)) {
             return std::string(text);
         }
     }
     return std::string{};
+}
+
+std::expected<std::string, std::string> OvCameraWatcher::CollectCurrentResult(int& after, AnswerMatch& match) {
+    std::string sid;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        sid = session_id_;
+    }
+    if (sid.empty()) return std::unexpected("没有有效的 QA 会话");
+    auto response = RequestOv(base_url_ + "/v1/glasses/sessions/" + sid +
+                              "/results?after=" + std::to_string(after) + "&wait=0", HTTP_METHOD_GET,
+                              kResultReadTimeoutMs, kMaxResultReplyBytes, {}, {}, nullptr);
+    if (!response) return std::unexpected(response.error());
+    if (response->status != 200) return std::unexpected("读取 OV 回答 HTTP " + std::to_string(response->status));
+
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(response->body.c_str()), cJSON_Delete);
+    const int cursor = ReadSequence(root.get(), "cursor");
+    const auto* results = cJSON_GetObjectItemCaseSensitive(root.get(), "results");
+    if (cursor < after || !cJSON_IsArray(results)) return std::unexpected("OV 结果页格式异常");
+    const cJSON* chosen = nullptr;
+    const cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, results) {
+        const int seq = ReadSequence(item, "seq");
+        const auto status = TextField(item, "status");
+        const auto text = TextField(item, "text");
+        if (seq <= after || seq > cursor || TextField(item, "type") != "answer" ||
+            TextField(item, "task_template") != "current_qa_v1" || (status != "ok" && !IsAnswerError(status)) ||
+            text.size() > kMaxAnswerBytes || text.find_first_not_of(" \t\r\n") == std::string_view::npos) continue;
+        // 网关不回传问题 ID。单问题会话若出现多个当前答案，不能随意挑一条。
+        if (chosen) return std::unexpected("OV 返回多条当前答案，无法确认归属");
+        chosen = item;
+    }
+    if (!chosen) {
+        after = cursor;
+        return std::string{};
+    }
+    // 提问和取证时序由 harness 负责；不拿结果中的帧时间当作问题时间。
+    match.result_seq = ReadSequence(chosen, "seq");
+    match.status = TextField(chosen, "status");
+    after = cursor;
+    return std::string(TextField(chosen, "text"));
 }
 
 std::expected<std::string, std::string> OvCameraWatcher::CollectResults(int& logs_after, AnswerMatch& match) {

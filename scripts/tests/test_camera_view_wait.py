@@ -34,17 +34,20 @@ class CameraViewWaitTests(unittest.TestCase):
 #include <string_view>
 #include <thread>
 using namespace std::chrono_literals;
+int64_t esp_timer_get_time() { return 0; }
 struct OvCameraWatcher {
     struct ViewRequest { std::string question, reply; std::chrono::steady_clock::time_point deadline;
-                         bool current_only; std::string time_scope, status; };
-    struct ViewReply { std::string text, status; };
+                         bool current_only; std::string time_scope, status, session_id; };
+    struct ViewReply { std::string text, status, session_id; };
+    std::mutex session_mutex_; std::string session_id_ = "ov-123";
     std::mutex request_mutex_; std::condition_variable request_cv_;
     std::shared_ptr<ViewRequest> pending_; std::atomic<bool> watching_{false};
     static bool IsValidTimeScope(const std::string&);
     std::string GetView(const std::string&, const std::string& = "current");
-    std::expected<std::string, std::string> LookCurrent(const std::string& = {});
+    std::expected<std::string, std::string> LookCurrent(const std::string& = {}, std::string* = nullptr);
     std::expected<std::string, std::string> LookPast();
-    std::expected<std::string, std::string> LookOnce(const std::string&, const char*);
+    std::expected<std::string, std::string> LookOnce(const std::string&, const char*, std::string* = nullptr);
+    void WaitForWork(const std::shared_ptr<ViewRequest>&, int64_t);
     ViewReply RequestView(const std::string&, bool, const std::string&, std::chrono::steady_clock::time_point);
     bool FinishView(const std::shared_ptr<ViewRequest>&, const std::string&, const std::string&);
     std::shared_ptr<ViewRequest> take() {
@@ -81,12 +84,15 @@ int main() {
         assert(w.FinishView(r,"回答","ok") && asked.get() == "回答");
     }
     // look_current 询问当前人物活动与可能情绪，原样返回 OV 回答。
-    auto look = std::async(std::launch::async,[&]{ return w.LookCurrent(); });
+    std::string sid;
+    auto look = std::async(std::launch::async,[&]{ return w.LookCurrent({}, &sid); });
     auto glance = w.take();
     assert(!glance->current_only && glance->time_scope == "current" &&
            glance->question == "画面中是否有人，如果有人简洁描述他在干什么，以及可能的情绪，不超过30个字");
     assert(w.FinishView(glance,"桌上有一个蓝色杯子","ok"));
+    w.session_id_ = "ov-new";  // 元数据必须来自完成这条回答的会话。
     auto seen = look.get();
+    assert(sid == "ov-123");
     assert(seen && *seen == "桌上有一个蓝色杯子");
     {std::lock_guard<std::mutex> l(w.request_mutex_); assert(!w.pending_);}
     // 自定义问题原样传递，只看当下；空白仍使用 look_current 的默认问题。
@@ -140,7 +146,7 @@ int main() {
                            text=True, check=True)
             subprocess.run([str(exe)], check=True, timeout=25)
 
-    def test_question_waits_for_next_accepted_frame_without_stopping_cadence(self):
+    def test_current_bypasses_frame_tick_and_past_keeps_confirmed_frame(self):
         source = WATCH.read_text()
         loop = source[source.index('void OvCameraWatcher::RunLoop()'):
                       source.index('std::expected<void, std::string> OvCameraWatcher::OpenSession()')]
@@ -182,7 +188,7 @@ struct Application {
 struct OvCameraWatcher {
     struct ViewRequest { std::string question; std::chrono::steady_clock::time_point deadline; bool current_only = false;
                          std::string time_scope = "past"; };
-    struct AnswerMatch { double question_t, frame_t; bool current_only; std::string status; };
+    struct AnswerMatch { double question_t, frame_t; bool current_only; int result_seq = 0; std::string status; };
     bool watching_ = true, starting_ = true;
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
@@ -190,15 +196,33 @@ struct OvCameraWatcher {
     std::vector<std::string> events;
     unsigned frames = 0, polls = 0;
     double capture_t = 0;
+    bool current = false, inject_current = true;
+    unsigned fast_polls = 0;
+    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us) {
+        if (pending_ != snapshot || !watching_) return;
+        if (current && inject_current && frames == 1) {
+            assert(wake_us == 1000000);
+            now_us = 400000;
+            pending_ = std::make_shared<ViewRequest>(ViewRequest{"question", std::chrono::steady_clock::time_point::max(), false, "current"});
+            inject_current = false;
+            return;
+        }
+        if (wake_us > now_us) now_us = wake_us;
+    }
     std::string answer_status = "ok";
     void RunLoop();
     Result<int> OpenSession() { events.push_back("open"); return {true}; }
     void CloseSession() { events.push_back("close"); }
     Result<std::optional<double>> PushOneFrame(int64_t start) {
-        assert(now_us == int64_t(frames) * 1000000);
+        assert(now_us == int64_t(frames) * 1000000 ||
+               (answer_status == "stream_unavailable" && frames == 5 && now_us == 4050000));
         capture_t = (esp_timer_get_time() - start) / 1000000.0;
         now_us += 50000;
         events.push_back("frame" + std::to_string(++frames));
+        if (current) {
+            if (frames == 2) watching_ = false;
+            return {true, capture_t};
+        }
         switch (frames) {
         case 1:
             pending_ = std::make_shared<ViewRequest>(ViewRequest{"question", std::chrono::steady_clock::time_point::max()});
@@ -212,8 +236,17 @@ struct OvCameraWatcher {
     Result<int> SendQuestion(const std::string& question, double t, const std::string& scope) {
         events.push_back("ask");
         // 采样任务把请求里的 time_scope 原样交给网关。
-        assert(question == "question" && t > capture_t && scope == "past");
+        assert(question == "question" && t > capture_t);
+        if (current) { assert(scope == "current" && (t == 0.4 || t == 0.05) && frames == 1); }
+        else { assert(scope == "past"); }
         return {true};
+    }
+    Result<std::string> CollectCurrentResult(int&, AnswerMatch& match) {
+        assert(current && frames == 1 && match.frame_t == 0);
+        assert(now_us == static_cast<int64_t>(match.question_t * 1000000) + fast_polls * 250000);
+        events.push_back("fast-poll");
+        match.status = answer_status;
+        return {true, ++fast_polls == 2 ? "answer" : ""};
     }
     Result<std::string> CollectResults(int& after, AnswerMatch& match) {
         ++after;
@@ -248,10 +281,25 @@ int main() {
     lost.answer_status = "stream_unavailable";
     lost.RunLoop();
     const std::vector<std::string> reopened = {
-        "open", "frame1", "frame2", "frame3", "frame4", "ask", "frame5", "poll", "answer",
+        "open", "frame1", "frame2", "frame3", "frame4", "ask", "frame5", "poll",
         "close", "open", "frame6", "close"
     };
     assert(lost.events == reopened);
+    for (bool before_first_frame : {false, true}) {
+        now_us = 0;
+        OvCameraWatcher current;
+        current.current = true;
+        if (before_first_frame) {
+            current.inject_current = false;
+            current.pending_ = std::make_shared<OvCameraWatcher::ViewRequest>(OvCameraWatcher::ViewRequest{
+                "question", std::chrono::steady_clock::time_point::max(), false, "current"});
+        }
+        current.RunLoop();
+        const std::vector<std::string> fast = {
+            "open", "frame1", "ask", "fast-poll", "fast-poll", "answer", "frame2", "close"
+        };
+        assert(current.events == fast);
+    }
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
@@ -308,6 +356,25 @@ struct OvCameraWatcher {
         driver = r'''
 int main() {
     OvCameraWatcher w;
+    int cursor = 4;
+    OvCameraWatcher::AnswerMatch direct{11, 10.9};
+    replies = {
+        {"/results?after=4&wait=0", R"({"cursor":6,"results":[
+            {"seq":4,"type":"answer","task_template":"current_qa_v1","status":"ok","text":"旧答案"},
+            {"seq":6,"type":"caption","text":"不是问答"}
+        ]})"},
+        {"/results?after=6&wait=0", R"({"cursor":7,"results":[
+            {"seq":7,"type":"answer","task_template":"current_qa_v1","status":"ok","t":10.5,"text":"蓝色"}
+        ]})"},
+        {"/results?after=7&wait=0", R"({"cursor":9,"results":[
+            {"seq":8,"type":"answer","task_template":"current_qa_v1","status":"ok","text":"甲"},
+            {"seq":9,"type":"answer","task_template":"current_qa_v1","status":"ok","text":"乙"}
+        ]})"},
+    };
+    assert(w.CollectCurrentResult(cursor, direct).value().empty() && cursor == 6);
+    assert(w.CollectCurrentResult(cursor, direct).value() == "蓝色" && cursor == 7);
+    assert(direct.result_seq == 7 && direct.status == "ok");
+    assert(!w.CollectCurrentResult(cursor, direct) && cursor == 7);
     int after = 0;
     replies = {
         {"/logs?after=0&limit=100", R"({"next_after":10,"events":[

@@ -320,10 +320,12 @@ private:
             auto tool = std::make_unique<McpTool>(name, description, properties,
                 [this, past](const PropertyList& arguments) -> ToolResult {
                     if (!camera_ || !camera_ready_) return std::unexpected("摄像头未就绪");
+                    std::string session_id;
                     auto seen = past ? camera_->LookPast()
-                                     : camera_->LookCurrent(arguments["question"].value<std::string>());
+                                     : camera_->LookCurrent(arguments["question"].value<std::string>(), &session_id);
                     if (!seen) return std::unexpected(seen.error());
-                    return ReturnValue(std::move(*seen));
+                    if (past) return ReturnValue(std::move(*seen));
+                    return ReturnValue(McpTextWithMeta{std::move(*seen), "ov_session_id", std::move(session_id)});
                 });
             tool->set_background(true);
             tool->set_result_mime_type("text/plain");

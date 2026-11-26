@@ -55,8 +55,15 @@ public:
 
 class PropertyList;
 
+// 诊断元数据与正文分离，后台可以记录，模型和语音仍只消费 content。
+struct McpTextWithMeta {
+    std::string text;
+    std::string meta_key;
+    std::string meta_value;
+};
+
 // Pointer alternatives transfer ownership to McpTool::Call.
-using ReturnValue = std::variant<bool, int, std::string, cJSON*, ImageContent*>;
+using ReturnValue = std::variant<bool, int, std::string, cJSON*, ImageContent*, McpTextWithMeta>;
 using ToolResult = std::expected<ReturnValue, std::string>;
 using ToolCallback = std::function<ToolResult(const PropertyList&)>;
 
@@ -461,7 +468,15 @@ public:
                 return std::unexpected("Failed to allocate MCP text result");
             }
             cJSON_AddStringToObject(text.get(), "type", "text");
-            if (std::holds_alternative<std::string>(return_value)) {
+            if (const auto* annotated = std::get_if<McpTextWithMeta>(&return_value)) {
+                cJSON_AddStringToObject(text.get(), "text", annotated->text.c_str());
+                if (!annotated->meta_value.empty()) {
+                    auto* meta = cJSON_AddObjectToObject(result.get(), "_meta");
+                    if (!meta || !cJSON_AddStringToObject(meta, annotated->meta_key.c_str(), annotated->meta_value.c_str())) {
+                        return std::unexpected("Failed to allocate MCP result metadata");
+                    }
+                }
+            } else if (std::holds_alternative<std::string>(return_value)) {
                 cJSON_AddStringToObject(text.get(), "text",
                                         std::get<std::string>(return_value).c_str());
             } else if (std::holds_alternative<bool>(return_value)) {

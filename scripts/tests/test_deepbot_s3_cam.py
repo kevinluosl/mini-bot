@@ -853,10 +853,9 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         # 采样周期固定 1000ms
         self.assertIn("kFrameIntervalMs = 1000", source)
 
-        # 周期必须用“反算剩余等待”实现，而不能“处理完再固定 delay”
-        # 否则处理变慢时实际周期会被拉长到 2 秒以上
-        self.assertIn("remain_ms = kFrameIntervalMs - elapsed_ms", source)
-        self.assertIn("if (remain_ms > 0)", source)
+        # 下一帧按实际开始时间计，结果轮询不能重置帧节拍。
+        self.assertIn('next_frame_us = esp_timer_get_time() + kFrameIntervalMs * 1000LL;', source)
+        self.assertIn('int64_t wake_us = next_frame_us;', source)
 
         # 缓存上限 5 条
         self.assertIn("kMaxAnswers = 5", header)
@@ -913,7 +912,7 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIn("xTaskCreatePinnedToCore", source)
 
     def test_camera_gateway_protocol_order(self):
-        """QA 会话按新帧提问，通过诊断关联单次答案，不主动上报。"""
+        """当前画面直接提问并读取结果，回看保留诊断关联。"""
         source = (ROOT / "main/boards/common/ov_camera_watcher.cc").read_text(encoding="utf-8")
 
         for path in ("/v1/glasses/sessions", "/text", "/frame?t=", "/logs?after=", "/results?after=", "DELETE"):
@@ -942,8 +941,10 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertEqual(source.count('SendQuestion('), 2)  # 定义和 look / get_view 共用调用点
         self.assertIn('SendQuestion(active->question, match.question_t, active->time_scope)', frames)
         self.assertIn('cJSON_AddStringToObject(root, "time_scope", time_scope.c_str())', source)
-        self.assertIn('if (active && watching_ && std::chrono::steady_clock::now() < active->deadline)', frames)
+        self.assertIn('if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;', frames)
         self.assertIn('CollectResults(logs_after, match)', frames)
+        self.assertIn('CollectCurrentResult(result_after, match)', frames)
+        self.assertLess(frames.index('if (!active && wants_current && latest_frame)'), frames.index('PushOneFrame(start_us)'))
         self.assertIn('if ((active && active != requested) || stream_lost)', frames)
         # 流式会话失效后必须重建会话，否则同一会话的回看会一直失败。
         self.assertIn('stream_lost = match.status == "stream_unavailable";', frames)
@@ -967,7 +968,7 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIn('if (!past) {\n                properties.AddProperty(Property("question", kPropertyTypeString, std::string{}));', look)
         self.assertIn('std::make_unique<McpTool>(name, description, properties,', look)
         self.assertIn('auto seen = past ? camera_->LookPast()', look)
-        self.assertIn(': camera_->LookCurrent(arguments["question"].value<std::string>());', look)
+        self.assertIn(': camera_->LookCurrent(arguments["question"].value<std::string>(), &session_id);', look)
         # 失败以工具错误返回，不当作画面线索。
         self.assertIn('if (!seen) return std::unexpected(seen.error());', look)
         self.assertIn('tool->set_background(true)', look)
@@ -977,8 +978,8 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertNotIn('不先说话', look)
         self.assertIn('无人时不播报结果', look)
         # 当前问题可覆盖默认值，回看仍用固定问题；两者各自锁定时间范围。
-        self.assertIn('return LookOnce(kLookCurrentQuestion, "current");', source)
-        self.assertIn('return LookOnce(question, "current");', source)
+        self.assertIn('return LookOnce(kLookCurrentQuestion, "current", session_id);', source)
+        self.assertIn('return LookOnce(question, "current", session_id);', source)
         self.assertIn('"画面中是否有人，如果有人简洁描述他在干什么，以及可能的情绪，不超过30个字"', source)
         self.assertIn('return LookOnce(kLookPastQuestion, "past");', source)
         self.assertIn('"总结过去一分钟画面前的人在做什么？如果没有人，就回答没有人。"', source)

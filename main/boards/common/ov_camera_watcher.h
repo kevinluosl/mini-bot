@@ -43,7 +43,8 @@ public:
     // look_past：固定问题回看约一分钟画面前的人在做什么（time_scope=past）。
     // 两者都只问 OV 一次，成功时原样返回 OV 原话；
     // 流式会话失效、超时等非 ok 结果返回错误，由 MCP 工具如实报告。
-    std::expected<std::string, std::string> LookCurrent(const std::string& question = {});
+    std::expected<std::string, std::string> LookCurrent(const std::string& question = {},
+                                                        std::string* session_id = nullptr);
     std::expected<std::string, std::string> LookPast();
     static bool IsValidTimeScope(const std::string& time_scope);
     std::string GetRecentAnswersJson() const;
@@ -67,15 +68,19 @@ private:
         std::string time_scope = "auto";
         // 采样任务在完成时写入网关 status，LookOnce 据此区分正常回答和工具错误。
         std::string status;
+        std::string session_id;
     };
     struct ViewReply {
         std::string text;
         std::string status;  // 空表示本地失败（超时、未观察、忙）
+        std::string session_id = {};
     };
     ViewReply RequestView(const std::string& question, bool current_only, const std::string& time_scope,
                           std::chrono::steady_clock::time_point deadline);
     // LookCurrent / LookPast 共用：提一次问题，把非 ok 结果转成工具错误。
-    std::expected<std::string, std::string> LookOnce(const std::string& question, const char* time_scope);
+    std::expected<std::string, std::string> LookOnce(const std::string& question, const char* time_scope,
+                                                      std::string* session_id = nullptr);
+    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us);
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
     std::shared_ptr<ViewRequest> pending_;
@@ -100,7 +105,8 @@ private:
         std::string task_template;
         std::string status;
     };
-    // 先用诊断事件关联本轮问题，再从 /results 按确切序号取答案。
+    // 当前画面按结果游标取答；诊断事件只用于现有的回看和自动范围校验。
+    std::expected<std::string, std::string> CollectCurrentResult(int& after, AnswerMatch& match);
     std::expected<std::string, std::string> CollectResults(int& logs_after, AnswerMatch& match);
     static bool ReadAnswerLogPage(const std::string& body, int& after, AnswerMatch& match);
     static std::expected<std::string, std::string> SelectAnswer(const std::string& body, const AnswerMatch& match);
