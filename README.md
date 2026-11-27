@@ -16,7 +16,7 @@
 
 ## 实机演示
 
-**mini-bot 实机演示**（约 42 秒）
+**基础演示1**（约 42 秒）
 
 <a href="https://github.com/kevinluosl/mini-bot/raw/refs/heads/main/docs/demos/basic-demo-01.mp4"><img src="docs/images/basic-demo-01.jpg" alt="mini-bot 基础演示 01 视频封面" width="240"></a>
 
