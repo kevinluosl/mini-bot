@@ -11,6 +11,50 @@ WATCH = ROOT / 'main/boards/common/ov_camera_watcher.cc'
 
 
 class CameraViewWaitTests(unittest.TestCase):
+    def test_stop_returns_while_worker_is_busy_and_does_not_hold_voice(self):
+        source = WATCH.read_text()
+        header = WATCH.with_suffix('.h').read_text()
+        stop = source[source.index('void OvCameraWatcher::Stop()'):
+                      source.index('void OvCameraWatcher::TaskEntry(')]
+        transition = next(line for line in header.splitlines() if 'bool HasPendingTransition()' in line)
+        harness = r'''
+#include <atomic>
+#include <cassert>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <string>
+#define ESP_LOGI(...) ((void)0)
+#define pdMS_TO_TICKS(ms) (ms)
+unsigned delay_calls = 0;
+void vTaskDelay(int) { ++delay_calls; }
+struct OvCameraWatcher {
+    std::atomic<bool> watching_{true}, starting_{true}, task_running_{true};
+    std::mutex lifecycle_mutex_, request_mutex_, answers_mutex_;
+    std::condition_variable request_cv_;
+    std::shared_ptr<int> pending_ = std::make_shared<int>(1);
+    std::string answers_;
+    void Stop();
+'''
+        driver = r'''
+int main() {
+    OvCameraWatcher watch;
+    assert(watch.HasPendingTransition());
+    watch.Stop();
+    // 假设网络任务一直没退出：Stop 仍必须立即回执，并解除语音状态等待。
+    assert(watch.task_running_ && !watch.watching_ && !watch.pending_);
+    assert(!watch.HasPendingTransition() && delay_calls == 0);
+    watch.Stop();
+    assert(watch.task_running_ && delay_calls == 0);
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / 'stop_test'
+            subprocess.run([os.environ.get('CXX', 'c++'), '-x', 'c++', '-std=c++23', '-pthread',
+                            '-o', str(exe), '-'], input=harness + transition + '\n};\n' + stop + driver,
+                           text=True, check=True)
+            subprocess.run([str(exe)], check=True, timeout=5)
+
     def test_deadline_and_request_identity(self):
         source = WATCH.read_text()
         methods = source[source.index('bool OvCameraWatcher::IsValidTimeScope('):

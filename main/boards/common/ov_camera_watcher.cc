@@ -151,28 +151,14 @@ void OvCameraWatcher::Stop() {
         pending_.reset();
     }
     request_cv_.notify_all();
-
-    // 等任务自己退出，但不在主线程上久等。
-    //
-    // 本函数可能被 MCP 工具（主线程）或串口命令调用，阻塞太久会卡住音频与显示。
-    // 所以只等 2 秒：任务正常情况下在 delay 或短 HTTP 里，能很快看到
-    // watching_ 变 false 并退出；即使这一轮正在跑长 HTTP（超时上限几秒），
-    // 它也会在自己退出时调 CloseSession() 收尾，不需要 Stop 帮它兜。
-    for (int i = 0; i < 20 && task_running_; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    // 网关 I/O 完全由采样任务串行管理，Stop 不删除仍在使用的会话。
-    ESP_LOGI(kTag, "已停止观察，缓存 %d 条答案",
-             [this] {
-                 std::lock_guard<std::mutex> lock(answers_mutex_);
-                 return (int)answers_.size();
-             }());
+    // MCP 在主循环执行，不能等在途 HTTP。网络资源由观察任务独占并释放。
+    ESP_LOGI(kTag, "已请求停止观察");
 }
 
 void OvCameraWatcher::TaskEntry(void* arg) {
     auto* self = static_cast<OvCameraWatcher*>(arg);
     self->RunLoop();
+    ESP_LOGI(kTag, "观察及网关会话清理已结束");
     // 到这里不再读取会话配置，允许下次 Start 写入新配置。
     self->starting_ = false;
     self->task_running_ = false;
@@ -198,7 +184,9 @@ void OvCameraWatcher::RunLoop() {
             watching_ = false;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        // 失败退避仍可被 Stop 唤醒；期间的新提问不会提前触发下一次建连。
+        std::unique_lock<std::mutex> lock(request_mutex_);
+        request_cv_.wait_for(lock, std::chrono::seconds(2), [this] { return !watching_; });
     }
     constexpr int64_t kPollIntervalUs = 250000;
     int64_t start_us = esp_timer_get_time();

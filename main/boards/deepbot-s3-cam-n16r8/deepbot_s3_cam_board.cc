@@ -301,7 +301,7 @@ private:
                     });
 
         mcp.AddTool("self.camera.stop_watch",
-                    "停止持续观察画面，释放摄像头与服务器会话。"
+                    "停止持续观察画面，后台关闭视觉网关会话。"
                     "用户说“不用看了”“关上眼睛”时调用。",
                     PropertyList(),
                     [this](const PropertyList&) -> ReturnValue {
@@ -309,7 +309,7 @@ private:
                             return std::string("摄像头未就绪");
                         }
                         camera_->Stop();
-                        return std::string("已停止观察画面");
+                        return std::string("已请求停止观察，不再接受画面查询");
                     });
 
         // 只给当前画面工具开放自定义 question；回看继续使用板端固定问题。
@@ -500,7 +500,7 @@ private:
                 }
                 if (std::strcmp(action, "stop") == 0) {
                     self->camera_->Stop();
-                    printf("已停止观察\n");
+                    printf("已请求停止观察\n");
                     return 0;
                 }
                 // 自定义时间范围只留在本地串口调试，不向模型开放。
@@ -1122,7 +1122,7 @@ public:
             xSemaphoreGive(head_motion_mutex_);
             if (moving) return true;
         }
-        // 只等首次建会话或停机清理，不等待持续观察本身。
+        // 只等开启阶段；关闭时后台清理，不能推迟本轮退出 Speaking。
         if (camera_ != nullptr && camera_->HasPendingTransition()) return true;
         // 不同时持舵机锁和显示锁，避免跨任务相互等待。
         return display_ != nullptr && display_->HasPendingToolEmotion();

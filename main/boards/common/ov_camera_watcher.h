@@ -33,10 +33,11 @@ public:
     bool IsReady() const { return initialized_; }
 
     std::expected<void, std::string> Start();
-    // 停止观察并关闭网关会话。未在观察时什么都不做（幂等）。
+    // 立即停止接收观察请求；正在执行的 I/O 和会话清理由观察任务完成。
     void Stop();
     bool IsWatching() const { return watching_; }
-    bool HasPendingTransition() const { return starting_ || (!watching_ && task_running_); }
+    // 关闭仅清理网络资源，不应推迟下一轮聆听。
+    bool HasPendingTransition() const { return watching_ && starting_; }
 
     // OV 专用观察查询和最近答案缓存，不是 DeepSeek 单拍入口。
     // time_scope 取 current / past / auto，原样传给网关决定看当前帧还是回看。
