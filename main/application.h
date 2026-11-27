@@ -124,8 +124,8 @@ public:
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
-    // 发送由板端内部构造的 JSON-RPC 通知；只在可接话的设备状态发布。
-    void SendServerMcpNotification(const std::string& payload);
+    // 传感器只在可接话时发布；监控命中交给服务端排队，不打断现有播报。
+    void SendServerMcpNotification(const std::string& payload, bool idle_only = true);
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }

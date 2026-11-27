@@ -95,6 +95,10 @@ bool OvCameraWatcher::Initialize() {
 
 std::expected<void, std::string> OvCameraWatcher::Start() {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    return StartLocked();
+}
+
+std::expected<void, std::string> OvCameraWatcher::StartLocked() {
     if (!initialized_) {
         return std::unexpected("摄像头未初始化，无法开始观察");
     }
@@ -141,8 +145,63 @@ std::expected<void, std::string> OvCameraWatcher::Start() {
     return {};
 }
 
+OvCameraWatcher::MonitorStatus OvCameraWatcher::GetMonitorStatus() const {
+    std::lock_guard<std::mutex> lock(monitor_mutex_);
+    return monitor_;
+}
+
+void OvCameraWatcher::SetMonitor(MonitorStatus settings) {
+    {
+        std::scoped_lock lock(request_mutex_, monitor_mutex_);
+        monitor_ = std::move(settings);
+        ++monitor_revision_;
+    }
+    request_cv_.notify_all();
+}
+
+std::expected<void, std::string> OvCameraWatcher::StartMonitor(const std::string& condition, bool silent_if_negative) {
+    if (condition.size() > 2048 || condition.find_first_not_of(" \t\r\n") == std::string::npos) {
+        return std::unexpected("请填写简短、非空的监控条件");
+    }
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    auto current = GetMonitorStatus();
+    if (watching_ && current.condition == condition && current.silent_if_negative == silent_if_negative) return {};
+    if (auto started = StartLocked(); !started) return started;
+    SetMonitor({condition, silent_if_negative, false});
+    return {};
+}
+
+void OvCameraWatcher::StopMonitor() {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!GetMonitorStatus().condition.empty()) SetMonitor({});
+}
+
+void OvCameraWatcher::PublishMonitorEvent(const std::string& id, int seq, const std::string& text,
+                                           const MonitorStatus& settings) {
+    auto message = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>(cJSON_CreateObject(), cJSON_Delete);
+    if (!message) return;
+    cJSON_AddStringToObject(message.get(), "jsonrpc", "2.0");
+    cJSON_AddStringToObject(message.get(), "method", "notifications/camera/watch");
+    auto* params = cJSON_AddObjectToObject(message.get(), "params");
+    if (!params) return;
+    cJSON_AddStringToObject(params, "watch_id", id.c_str());
+    cJSON_AddNumberToObject(params, "seq", seq);
+    if (seq == 0) {
+        cJSON_AddBoolToObject(params, "stopped", true);
+    } else {
+        cJSON_AddStringToObject(params, "text", text.c_str());
+        cJSON_AddStringToObject(params, "condition", settings.condition.c_str());
+        cJSON_AddBoolToObject(params, "silent_if_negative", settings.silent_if_negative);
+    }
+    if (auto* json = cJSON_PrintUnformatted(message.get())) {
+        Application::GetInstance().SendServerMcpNotification(json, /*idle_only=*/false);
+        cJSON_free(json);
+    }
+}
+
 void OvCameraWatcher::Stop() {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!GetMonitorStatus().condition.empty()) SetMonitor({});
     if (!watching_) return;
 
     watching_ = false;
@@ -181,8 +240,13 @@ void OvCameraWatcher::RunLoop() {
         }
         ESP_LOGW(kTag, "建会话失败 (%d/%d): %s", attempt, kMaxFailures, result.error().c_str());
         if (attempt >= kMaxFailures) {
-            watching_ = false;
-            break;
+            if (GetMonitorStatus().condition.empty()) {
+                watching_ = false;
+                break;
+            }
+            // 监控可以继续后台重连，但不能无限占着语音轮的初始化等待。
+            if (starting_.exchange(false)) Application::GetInstance().NotifyToolActivityDone();
+            attempt = kMaxFailures - 1;
         }
         // 失败退避仍可被 Stop 唤醒；期间的新提问不会提前触发下一次建连。
         std::unique_lock<std::mutex> lock(request_mutex_);
@@ -191,7 +255,28 @@ void OvCameraWatcher::RunLoop() {
     constexpr int64_t kPollIntervalUs = 250000;
     int64_t start_us = esp_timer_get_time();
     int64_t next_frame_us = start_us, next_poll_us = 0;
+    uint32_t monitor_revision = monitor_revision_.load();
+    auto monitor = GetMonitorStatus();
+    std::string watch_id;
+    bool watch_armed = false;
+    bool waiting_for_clear = false;
+    int64_t wait_clear_until_us = 0;
+    int64_t last_report_us = 0;
+    std::string last_report_text;
+    int64_t confirm_by_us = 0;
+    int64_t clear_check_by_us = 0;
+    uint32_t clear_check_revision = 0;
+    int64_t retry_monitor_after_us = 0;
+    const auto close_monitor = [&] {
+        if (!watch_id.empty()) PublishMonitorEvent(watch_id, 0, {}, {});
+        watch_id.clear();
+        watch_armed = false;
+        confirm_by_us = clear_check_by_us = 0;
+        std::lock_guard<std::mutex> lock(monitor_mutex_);
+        if (monitor_revision == monitor_revision_.load()) monitor_.ready = false;
+    };
     std::shared_ptr<ViewRequest> active;
+    int64_t abandoned_query_until_us = 0;
     AnswerMatch match{};
     int result_after = 0;
     int consecutive_failures = 0;
@@ -209,15 +294,57 @@ void OvCameraWatcher::RunLoop() {
             std::lock_guard<std::mutex> guard(request_mutex_);
             requested = pending_;
         }
-        // 不确定网关是否已收到的提问仍可能迟到。先换会话，再接新问题。
-        if ((active && active != requested) || stream_lost) {
+        const auto wanted_revision = monitor_revision_.load();
+        if (wanted_revision != monitor_revision) {
+            // 尚未收到建立回执时，旧 auto 可能还在路由；直接换会话隔离迟到事件。
+            const bool pending_monitor = confirm_by_us != 0;
+            const bool confirmed_monitor = watch_armed;
+            const auto outstanding_check = clear_check_by_us;
+            close_monitor();
+            // 恢复检查是普通问题。停提醒也把该答案读掉，不必因此丢弃观察历史。
+            clear_check_by_us = outstanding_check;
+            if ((confirmed_monitor || pending_monitor) && !ClearWatch(http)) stream_lost = true;
+            if (pending_monitor) stream_lost = true;  // 隔离可能迟到的建立事件。
+            monitor_revision = wanted_revision;
+            monitor = GetMonitorStatus();
+            waiting_for_clear = false;
+            last_report_text.clear();
+            retry_monitor_after_us = 0;
+        }
+        // 恢复判断可能连续返回 WAIT。不能让一个不明确的答复永久停住下一次检测。
+        if (waiting_for_clear && !clear_check_by_us && now_us >= wait_clear_until_us) {
+            waiting_for_clear = false;
+            retry_monitor_after_us = 0;
+        }
+        if ((confirm_by_us && now_us >= confirm_by_us) || (clear_check_by_us && now_us >= clear_check_by_us)) {
+            stream_lost = true;
+            retry_monitor_after_us = now_us + 5000000;
+        }
+        if (active && active != requested && !abandoned_query_until_us) {
+            abandoned_query_until_us = now_us + 6000000;
+        }
+        bool query_abandoned = abandoned_query_until_us != 0;
+        // /text 没有请求 ID。监控中先继续拉结果，给迟到的单次答案一点时间；
+        // 一直等不到才换会话并重新布防，不能让旧问题无限挡住后续看图或监控复位。
+        if ((query_abandoned && (monitor.condition.empty() || now_us >= abandoned_query_until_us)) || stream_lost) {
+            if (active && active == requested) FinishView(active, kSessionExpired, "stream_unavailable");
             stream_lost = false;
+            close_monitor();
             CloseSession(http);
-            if (!watching_ || !OpenSession(http)) {
-                watching_ = false;
-                break;
+            if (!watching_) break;
+            if (!OpenSession(http)) {
+                if (monitor.condition.empty()) {
+                    watching_ = false;
+                    break;
+                }
+                // 监控的启用状态不因一次 OV 断线消失；重建同一规则，而不是补播旧结果。
+                stream_lost = true;
+                WaitForWork(requested, esp_timer_get_time() + 2000000, &monitor_revision);
+                continue;
             }
             active.reset();
+            query_abandoned = false;
+            abandoned_query_until_us = 0;
             result_after = consecutive_failures = 0;
             latest_frame.reset();
             start_us = next_frame_us = esp_timer_get_time();
@@ -240,23 +367,111 @@ void OvCameraWatcher::RunLoop() {
             next_poll_us = esp_timer_get_time();
         };
         const auto poll = [&] {
-            if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;
+            const bool has_query = active && !query_abandoned && std::chrono::steady_clock::now() < active->deadline;
+            if (!watching_ || (active && !has_query && !query_abandoned)) return;
+            match.query_pending = active || clear_check_by_us;
+            match.monitor_registering = confirm_by_us != 0;
+            match.monitor_accepted = false;
+            match.status.clear();
+            match.reports.clear();
             auto answer = CollectResults(http, result_after, match);
-            next_poll_us = esp_timer_get_time() + kPollIntervalUs;
+            next_poll_us = esp_timer_get_time() + (has_query || confirm_by_us || clear_check_by_us ? kPollIntervalUs : 1000000);
             if (!answer) {
                 ESP_LOGW(kTag, "OV 拉取结果失败: %s", answer.error().c_str());
-            } else if (!answer->empty() && FinishView(active, *answer, match.status)) {
+                return;
+            }
+            if (match.monitor_accepted) {
+                confirm_by_us = 0;
+                watch_armed = true;
+                std::lock_guard<std::mutex> lock(monitor_mutex_);
+                if (monitor_revision == monitor_revision_.load()) monitor_.ready = true;
+            }
+            if (watch_armed && monitor_revision == monitor_revision_.load()) {
+                for (const auto& [seq, text] : match.reports) {
+                    if (!watching_ || monitor_revision != monitor_revision_.load()) break;
+                    // 命中会注销网关规则。先在后台确认情况已经结束，避免对持续画面反复提醒。
+                    const auto report_us = esp_timer_get_time();
+                    // 恢复检查若没能确认画面变化，至少不把短时间内相同的结果反复播报。
+                    if (last_report_text != text || report_us - last_report_us >= 30000000) {
+                        PublishMonitorEvent(watch_id, seq, text, monitor);
+                    }
+                    last_report_text = text;
+                    last_report_us = report_us;
+                    waiting_for_clear = true;
+                    wait_clear_until_us = report_us + 15000000;
+                    retry_monitor_after_us = report_us + 2000000;
+                    watch_armed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(monitor_mutex_);
+                        if (monitor_revision == monitor_revision_.load()) monitor_.ready = false;
+                    }
+                    break;
+                }
+            }
+            if (match.status == "stream_unavailable") stream_lost = true;
+            if (match.status == "unexpected_watch") {
+                // 固定 scope 不应该进入提醒分支；已存在的真监控不由这次问答清理。
+                if (monitor.condition.empty() && !ClearWatch(http)) stream_lost = true;
+            } else if (confirm_by_us && !active && !answer->empty()) {
+                // 网关接受了 /text，但并未把它路由成提醒；不把普通回答误当命中。
+                confirm_by_us = 0;
+                close_monitor();
+                retry_monitor_after_us = esp_timer_get_time() + 10000000;
+            }
+            if (clear_check_by_us && !answer->empty()) {
+                clear_check_by_us = 0;
+                if (clear_check_revision != monitor_revision) return;
+                // 网关可能把否定型 auto 提示误当成原条件；这里用单次视觉回答的明确标记。
+                const auto first = answer->find_first_not_of(" \t\r\n");
+                waiting_for_clear = match.status != "ok" || first == std::string::npos ||
+                    std::string_view(*answer).substr(first, answer->find_last_not_of(" \t\r\n") - first + 1) != "CLEARED";
+                if (!waiting_for_clear) last_report_text.clear();
+                retry_monitor_after_us = esp_timer_get_time() + (waiting_for_clear ? 5000000 : 0);
+            } else if (has_query && !answer->empty() && FinishView(active, *answer, match.status)) {
                 ESP_LOGI(kTag, "OV answer seq=%d elapsed_ms=%lld", match.result_seq,
                          static_cast<long long>((esp_timer_get_time() - start_us) / 1000 - match.question_t * 1000));
                 if (match.status == "ok") AddAnswer(*answer);
-                stream_lost = match.status == "stream_unavailable";
                 active.reset();
+            } else if (query_abandoned && !answer->empty()) {
+                active.reset();
+                abandoned_query_until_us = 0;
             }
         };
         // 已有被接受的画面时优先提交 current；下一帧仍按自己的节拍上传。
         const bool wants_current = requested && requested->time_scope == "current";
-        if (!active && wants_current && latest_frame) submit(*latest_frame);
-        // 用独立的短轮询节拍取答，不使用会卡住推帧的长轮询。
+        if (!active && !confirm_by_us && !clear_check_by_us && wants_current && latest_frame) submit(*latest_frame);
+        // 旧单问尚未排空时不能发新的 /text，否则普通答案无法确认归属。
+        if (!active && !requested && !watch_armed && !confirm_by_us && !clear_check_by_us &&
+            !monitor.condition.empty() && latest_frame &&
+            now_us >= retry_monitor_after_us && monitor_revision == monitor_revision_.load()) {
+            const double t = (esp_timer_get_time() - start_us) / 1000000.0;
+            if (waiting_for_clear && t - *latest_frame < kCurrentFrameMaxAgeSec) {
+                const auto prompt = "只看当前画面。条件描述的动作仍在持续，或画面仍处于该动作或变化造成的目标状态，"
+                                    "只输出 WAIT（例如变红后仍是红色，不算结束）。画面不清楚也只输出 WAIT。"
+                                    "只有清楚看到动作已结束且画面脱离了目标状态，才只输出 CLEARED。不要解释。条件：" + monitor.condition;
+                if (SendQuestion(http, prompt, t, "current")) {
+                    clear_check_by_us = esp_timer_get_time() + 6000000;
+                    clear_check_revision = monitor_revision;
+                    next_poll_us = esp_timer_get_time();
+                } else {
+                    stream_lost = true;
+                    retry_monitor_after_us = esp_timer_get_time() + 5000000;
+                }
+            } else if (!waiting_for_clear) {
+                const auto prompt = "持续观察画面，只有看到以下情况实际发生时才主动提醒，不要报告未发生：" + monitor.condition;
+                if (SendQuestion(http, prompt, t, "auto")) {
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    watch_id = session_id_ + "-" + std::to_string(monitor_revision);
+                    confirm_by_us = esp_timer_get_time() + kViewTimeoutSec * 1000000LL;
+                    next_poll_us = esp_timer_get_time();
+                } else {
+                    // POST 超时可能已送达；不在同一个会话里重复建立规则。
+                    stream_lost = true;
+                    retry_monitor_after_us = esp_timer_get_time() + 5000000;
+                }
+            }
+        }
+        // 单问用短轮询，已建立的提醒空闲时每秒取一次；没有任何工作时不拉结果。
         if (active && active == requested &&
             esp_timer_get_time() >= next_poll_us) {
             // 提交失败会清掉 pending；不要再查可能已进入旧会话的结果。
@@ -266,6 +481,9 @@ void OvCameraWatcher::RunLoop() {
                 still_pending = pending_ == active;
             }
             if (still_pending) poll();
+        } else if ((query_abandoned || watch_armed || confirm_by_us || clear_check_by_us) &&
+                   esp_timer_get_time() >= next_poll_us) {
+            poll();
         }
         if (watching_ && !stream_lost && esp_timer_get_time() >= next_frame_us) {
             next_frame_us = esp_timer_get_time() + kFrameIntervalMs * 1000LL;
@@ -276,19 +494,25 @@ void OvCameraWatcher::RunLoop() {
                     if (active) FinishView(active, kSessionExpired, "stream_unavailable");
                     stream_lost = true;
                 } else if (++consecutive_failures >= kMaxFailures) {
-                    watching_ = false;
-                    break;
+                    if (monitor.condition.empty()) {
+                        watching_ = false;
+                        break;
+                    }
+                    stream_lost = true;
+                    retry_monitor_after_us = esp_timer_get_time() + 5000000;
                 }
             } else {
                 consecutive_failures = 0;
                 if (frame->has_value()) latest_frame = **frame;
             }
-            if (!active && requested && frame && frame->has_value()) submit(**frame);
+            if (!active && !confirm_by_us && !clear_check_by_us && requested && frame && frame->has_value()) submit(**frame);
         }
         int64_t wake_us = next_frame_us;
-        if (active && next_poll_us < wake_us) wake_us = next_poll_us;
-        if (!stream_lost) WaitForWork(requested, wake_us);
+        if ((active || watch_armed || confirm_by_us || clear_check_by_us) && next_poll_us < wake_us) wake_us = next_poll_us;
+        if (abandoned_query_until_us && abandoned_query_until_us < wake_us) wake_us = abandoned_query_until_us;
+        if (!stream_lost) WaitForWork(requested, wake_us, &monitor_revision);
     }
+    close_monitor();
 
     {
         std::lock_guard<std::mutex> guard(request_mutex_);
@@ -412,10 +636,12 @@ OvCameraWatcher::ViewReply OvCameraWatcher::RequestView(const std::string& quest
             ""};
 }
 
-void OvCameraWatcher::WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us) {
+void OvCameraWatcher::WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us,
+                                  const uint32_t* monitor_revision) {
     std::unique_lock<std::mutex> lock(request_mutex_);
-    request_cv_.wait_for(lock, std::chrono::microseconds(wake_us - esp_timer_get_time()),
-                        [&] { return pending_ != snapshot || !watching_; });
+    request_cv_.wait_for(lock, std::chrono::microseconds(wake_us - esp_timer_get_time()), [&] {
+        return pending_ != snapshot || !watching_ || (monitor_revision && *monitor_revision != monitor_revision_.load());
+    });
 }
 
 bool OvCameraWatcher::FinishView(const std::shared_ptr<ViewRequest>& request, const std::string& reply,
@@ -505,6 +731,25 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     return std::unexpected("OV 推帧响应缺少 accepted");
 }
 
+std::expected<void, std::string> OvCameraWatcher::ClearWatch(OvHttpClient& http) {
+    std::string sid;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        sid = session_id_;
+    }
+    if (sid.empty()) return std::unexpected("没有有效会话");
+
+    auto response = http.Request("/v1/glasses/sessions/" + sid + "/watch", HTTP_METHOD_DELETE,
+                                 kResultReadTimeoutMs, kMaxControlReplyBytes);
+    if (!response) return std::unexpected(response.error());
+    if (response->status != 200) return std::unexpected("HTTP " + std::to_string(response->status));
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> reply(cJSON_Parse(response->body.c_str()), cJSON_Delete);
+    const auto* stopped = cJSON_GetObjectItemCaseSensitive(reply.get(), "stopped");
+    // false 表示当前没有活跃提醒，也符合清理完成的条件。
+    if (!cJSON_IsBool(stopped)) return std::unexpected("响应缺少有效的 stopped 字段");
+    return {};
+}
+
 std::expected<std::string, std::string> OvCameraWatcher::CollectResults(OvHttpClient& http, int& after, AnswerMatch& match) {
     std::string sid;
     {
@@ -541,12 +786,25 @@ std::expected<std::string, std::string> OvCameraWatcher::CollectResults(OvHttpCl
             return kSessionExpired;
         }
         const auto status = TextField(item, "status");
-        if (type != "answer" || status.empty() || status == "model_report") continue;
-        // 建提醒不是视觉答案；也不能让后续提醒混入下一次问答。
-        if (status == "watch_accepted") {
-            match.status = "stream_unavailable";
-            return "观察会话建立了异步提醒，无法继续单次问答";
+        if (type != "answer" || status.empty()) continue;
+        if (status == "model_report") {
+            // 命中和普通问题共享 seq，但永远不能作为 look 的答案。
+            const auto text = TextField(item, "text");
+            if ((!match.monitor_registering || match.monitor_accepted) && text.size() <= kMaxAnswerBytes &&
+                text.find_first_not_of(" \t\r\n") != std::string_view::npos &&
+                match.reports.size() < 8) match.reports.emplace_back(seq, std::string(text));
+            continue;
         }
+        if (status == "watch_accepted") {
+            if (match.monitor_registering) {
+                match.monitor_accepted = true;
+                continue;
+            }
+            after = newest;
+            match.status = "unexpected_watch";
+            return "网关建立了异步提醒，不是单次画面回答";
+        }
+        if (!match.query_pending && !match.monitor_registering) continue;
         if (chosen) return std::unexpected("OV 返回多条答案，无法确认归属");
         chosen = item;
     }

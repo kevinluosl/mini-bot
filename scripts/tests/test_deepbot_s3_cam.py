@@ -924,7 +924,9 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         stop = source.split('OvCameraWatcher::Stop()', 1)[1].split('\n}', 1)[0]
         for method in (start, stop):
             self.assertIn('std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_)', method)
-        self.assertLess(start.index('if (watching_) return {};'), start.index('xTaskCreatePinnedToCore'))
+        self.assertIn('return StartLocked();', start)
+        start_locked = source.split('OvCameraWatcher::StartLocked()', 1)[1].split('\n}', 1)[0]
+        self.assertLess(start_locked.index('if (watching_) return {};'), start_locked.index('xTaskCreatePinnedToCore'))
         self.assertLess(stop.index('if (!watching_) return;'), stop.index('watching_ = false;'))
 
         # 任务必须跑在独立 FreeRTOS 任务里，不能占主线程
@@ -954,16 +956,18 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         config = json.loads(payload.group(1))
         self.assertEqual((config['input_mode'], config['mode'], config['fps']), ('live', 'qa', 30.0))
         self.assertEqual(set(config), {'input_mode', 'mode', 'fps'})
-        self.assertEqual(source.count('SendQuestion('), 2)  # 定义和 look / get_view 共用调用点
+        self.assertEqual(source.count('SendQuestion('), 4)  # 定义、用户查询、恢复检查和持续提醒
+        self.assertIn('SendQuestion(http, prompt, t, "auto")', frames)
         self.assertIn('SendQuestion(http, active->question, match.question_t, active->time_scope)', frames)
         self.assertIn('cJSON_AddStringToObject(root, "time_scope", time_scope.c_str())', source)
-        self.assertIn('if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;', frames)
+        self.assertIn('if (!watching_ || (active && !has_query && !query_abandoned)) return;', frames)
         self.assertIn('CollectResults(http, result_after, match)', frames)
         self.assertIn('question_t - frame_t >= kCurrentFrameMaxAgeSec', frames)
-        self.assertLess(frames.index('if (!active && wants_current && latest_frame)'), frames.index('PushOneFrame(http, start_us)'))
-        self.assertIn('if ((active && active != requested) || stream_lost)', frames)
+        self.assertLess(frames.index('if (!active && !confirm_by_us && !clear_check_by_us && wants_current && latest_frame)'),
+                        frames.index('PushOneFrame(http, start_us)'))
+        self.assertIn('if ((query_abandoned && (monitor.condition.empty() || now_us >= abandoned_query_until_us)) || stream_lost)', frames)
         # 流式会话失效后必须重建会话，否则同一会话的回看会一直失败。
-        self.assertIn('stream_lost = match.status == "stream_unavailable";', frames)
+        self.assertIn('if (match.status == "stream_unavailable") stream_lost = true;', frames)
         self.assertIn('CloseSession(http);', frames)
         board = SOURCE.read_text()
         # 只留两个 look 供模型调用；串口问答不受影响。
@@ -973,7 +977,10 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         start_watch = board.split('mcp.AddTool("self.camera.start_watch",', 1)[1].split('mcp.AddTool("self.camera.stop_watch",', 1)[0]
         self.assertIn('PropertyList()', start_watch)
         self.assertIn('camera_->Start()', start_watch)
-        self.assertNotIn('notifications/camera/watch', board)
+        self.assertNotIn('notifications/camera/watch', start_watch)
+        self.assertIn('"self.camera.start_monitor"', board)
+        self.assertIn('"self.camera.stop_monitor"', board)
+        self.assertIn('"monitor_ready"', board)
         self.assertNotIn('Property("prompt"', start_watch)
         self.assertNotIn('camera_->Start()', ov)
         self.assertNotIn('CaptureJpeg()', ov)

@@ -31,6 +31,9 @@ void vTaskDelay(int) { ++delay_calls; }
 struct OvCameraWatcher {
     std::atomic<bool> watching_{true}, starting_{true}, task_running_{true};
     std::mutex lifecycle_mutex_, request_mutex_, answers_mutex_;
+    struct MonitorStatus { std::string condition = "举手"; } monitor;
+    MonitorStatus GetMonitorStatus() { return monitor; }
+    void SetMonitor(MonitorStatus value) { monitor = std::move(value); monitor.condition.clear(); }
     std::condition_variable request_cv_;
     std::shared_ptr<int> pending_ = std::make_shared<int>(1);
     std::string answers_;
@@ -42,7 +45,7 @@ int main() {
     assert(watch.HasPendingTransition());
     watch.Stop();
     // 假设网络任务一直没退出：Stop 仍必须立即回执，并解除语音状态等待。
-    assert(watch.task_running_ && !watch.watching_ && !watch.pending_);
+    assert(watch.task_running_ && !watch.watching_ && !watch.pending_ && watch.monitor.condition.empty());
     assert(!watch.HasPendingTransition() && delay_calls == 0);
     watch.Stop();
     assert(watch.task_running_ && delay_calls == 0);
@@ -91,7 +94,8 @@ struct OvCameraWatcher {
     std::expected<std::string, std::string> LookCurrent(const std::string& = {}, std::string* = nullptr);
     std::expected<std::string, std::string> LookPast();
     std::expected<std::string, std::string> LookOnce(const std::string&, const char*, std::string* = nullptr);
-    void WaitForWork(const std::shared_ptr<ViewRequest>&, int64_t);
+    std::atomic<uint32_t> monitor_revision_{0};
+    void WaitForWork(const std::shared_ptr<ViewRequest>&, int64_t, const uint32_t* = nullptr);
     ViewReply RequestView(const std::string&, const std::string&, std::chrono::steady_clock::time_point);
     bool FinishView(const std::shared_ptr<ViewRequest>&, const std::string&, const std::string&);
     std::shared_ptr<ViewRequest> take() {
@@ -197,6 +201,7 @@ int main() {
         # Execute the production loop with a deterministic clock and instrumented transport.
         # A question arrives during an upload, followed by a skipped and a failed frame.
         harness = r'''
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -213,6 +218,7 @@ int main() {
 constexpr int kFrameIntervalMs = 1000;
 constexpr double kCurrentFrameMaxAgeSec = 2.0;
 constexpr const char* kSessionExpired = "closed";
+constexpr int kViewTimeoutSec = 20;
 constexpr int64_t kHeapLogIntervalUs = 30000000;
 void LogWatchHeap() {}  // 芯片内存采样不参与帧时序判断。
 int64_t now_us = 0;
@@ -236,17 +242,34 @@ struct OvCameraWatcher {
     std::string base_url_ = "https://unit.test";
     struct ViewRequest { std::string question; std::chrono::steady_clock::time_point deadline;
                          std::string time_scope = "past"; };
-    struct AnswerMatch { double question_t; int result_seq = 0; std::string status; };
-    bool watching_ = true, starting_ = true;
+    struct AnswerMatch {
+        double question_t; int result_seq = 0; std::string status;
+        bool query_pending, monitor_registering, monitor_accepted;
+        std::vector<std::pair<int, std::string>> reports;
+    };
+    struct MonitorStatus { std::string condition; bool ready = false; } monitor_;
+    std::mutex monitor_mutex_, session_mutex_;
+    std::atomic<uint32_t> monitor_revision_{0};
+    std::string session_id_ = "fixture";
+    MonitorStatus GetMonitorStatus() { return monitor_; }
+    void PublishMonitorEvent(const std::string&, int seq, const std::string& text, const MonitorStatus&) {
+        events.push_back(seq ? "report:" + text : "monitor:stop");
+    }
+    bool ClearWatch(OvHttpClient&) { events.push_back("clear"); return true; }
+    bool watching_ = true;
+    std::atomic<bool> starting_{true};
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
     std::shared_ptr<ViewRequest> pending_;
     std::vector<std::string> events;
     unsigned frames = 0, polls = 0;
     double capture_t = 0;
-    bool current = false, inject_current = true, stale_current = false, cancel_answer = false;
+    bool current = false, inject_current = true, stale_current = false, cancel_answer = false, mode_monitor = false;
+    bool internal_check = false, stick_wait = false, missing_look = false;
+    unsigned recovery_checks = 0, session_opens = 0;
+    int64_t second_open_at = 0;
     unsigned fast_polls = 0;
-    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us) {
+    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us, const uint32_t*) {
         if (pending_ != snapshot || !watching_) return;
         if (current && inject_current && frames == 1) {
             assert(wake_us == 1000000);
@@ -263,18 +286,28 @@ struct OvCameraWatcher {
     Result<int> OpenSession(OvHttpClient& http) {
         if (transport) assert(transport == &http);
         transport = &http;
+        if (++session_opens == 2) second_open_at = now_us;
         events.push_back("open");
         return {true};
     }
     void CloseSession(OvHttpClient& http) { assert(transport == &http); events.push_back("close"); }
     Result<std::optional<double>> PushOneFrame(OvHttpClient& http, int64_t start) { assert(transport == &http);
         if (stale_current && frames == 1) assert(now_us == 2400000);
-        else if (!cancel_answer && answer_status == "ok" && !stale_current) {
+        else if (!cancel_answer && answer_status == "ok" && !stale_current && session_opens == 1) {
             assert(now_us == int64_t(frames) * 1000000);
         }
         capture_t = (esp_timer_get_time() - start) / 1000000.0;
         now_us += 50000;
         events.push_back("frame" + std::to_string(++frames));
+        if (mode_monitor) {
+            if (missing_look) {
+                if (frames == 13) watching_ = false;
+            } else {
+                if (frames == (stick_wait ? 24u : 16u)) { monitor_.condition.clear(); ++monitor_revision_; }
+                if (frames == (stick_wait ? 26u : 18u)) watching_ = false;
+            }
+            return {true, capture_t};
+        }
         if (current) {
             if (frames == (stale_current ? 3u : 2u)) watching_ = false;
             return {true, capture_t};
@@ -291,6 +324,15 @@ struct OvCameraWatcher {
     }
     Result<int> SendQuestion(OvHttpClient& http, const std::string& question, double t, const std::string& scope) { assert(transport == &http);
         events.push_back("ask");
+        if (mode_monitor && scope == "auto") {
+            assert(question.find("举手") != std::string::npos);
+            return {true};
+        }
+        if (mode_monitor) {
+            assert(scope == "current");
+            internal_check = question.find("CLEARED") != std::string::npos;
+            return {true};
+        }
         // 采样任务把请求里的 time_scope 原样交给网关。
         assert(question == "question" && t > capture_t);
         if (current) {
@@ -302,6 +344,43 @@ struct OvCameraWatcher {
     }
     Result<std::string> CollectResults(OvHttpClient& http, int& after, AnswerMatch& match) { assert(transport == &http);
         ++after;
+        if (mode_monitor) {
+            if (match.monitor_registering) {
+                events.push_back("accepted"); match.monitor_accepted = true;
+                if (frames == 1 || (missing_look && session_opens == 2)) {
+                    pending_ = std::make_shared<ViewRequest>(ViewRequest{"question", std::chrono::steady_clock::time_point::max(), "current"});
+                }
+            } else if (internal_check) {
+                assert(match.query_pending);
+                internal_check = false;
+                match.status = "ok";
+                const bool cleared = ++recovery_checks != 1 && !stick_wait;
+                events.push_back(cleared ? "recovered" : "still-present");
+                return {true, cleared ? "CLEARED" : "WAIT"};
+            } else if (match.query_pending) {
+                if (missing_look) {
+                    if (session_opens == 1) {
+                        pending_.reset();  // 第一问已结束，模拟网关永不返回它的答案。
+                        return {true, ""};
+                    }
+                    match.status = "ok";  // 新会话的普通问题正常回答。
+                    return {true, "answer"};
+                }
+                events.push_back("abandoned-look");
+                if (pending_) {
+                    pending_.reset();
+                    return {true, ""};
+                }
+                match.status = "ok";
+                match.reports.emplace_back(after - 1, "命中");
+                ++polls;
+                return {true, "late look"};
+            } else if (polls == 1 && frames >= 4) {
+                match.reports.emplace_back(after, "再次命中");
+                ++polls;
+            }
+            return {true, ""};
+        }
         if (current) {
             assert(frames == (stale_current ? 2u : 1u));
             assert(now_us == static_cast<int64_t>(match.question_t * 1000000) + fast_polls * 250000);
@@ -363,6 +442,40 @@ int main() {
         "open", "frame1", "frame2", "ask", "fast-poll", "fast-poll", "answer", "frame3", "close"
     };
     assert(stale.events == after_fresh_frame);
+    now_us = 0;
+    OvCameraWatcher monitored;
+    monitored.mode_monitor = true;
+    monitored.monitor_.condition = "举手";
+    monitored.RunLoop();
+    for (const auto& item : {"report:命中", "report:再次命中", "abandoned-look", "monitor:stop", "clear", "frame18"}) {
+        assert(std::count(monitored.events.begin(), monitored.events.end(), item) >= 1);
+    }
+    assert(std::count(monitored.events.begin(), monitored.events.end(), "open") == 1);
+    assert(std::count(monitored.events.begin(), monitored.events.end(), "close") == 1);
+    assert(std::count(monitored.events.begin(), monitored.events.end(), "report:恢复") == 0);
+    const auto still_present = std::find(monitored.events.begin(), monitored.events.end(), "still-present");
+    const auto recovered = std::find(monitored.events.begin(), monitored.events.end(), "recovered");
+    assert(still_present < recovered);
+    assert(std::find(still_present + 1, recovered, "accepted") == recovered);
+    assert(std::count(monitored.events.begin(), monitored.events.end(), "late look") == 0);
+    // 真网关可能反复给 WAIT。退避有上限，不能因这个分类结果永久停在第一次提醒。
+    now_us = 0;
+    OvCameraWatcher uncertain;
+    uncertain.mode_monitor = uncertain.stick_wait = true;
+    uncertain.monitor_.condition = "举手";
+    uncertain.RunLoop();
+    assert(std::count(uncertain.events.begin(), uncertain.events.end(), "report:再次命中") == 1);
+    assert(std::count(uncertain.events.begin(), uncertain.events.end(), "open") == 1);
+    // 看图永不回包时，监控开关保留；只在有界等待后重建，后续看图不被卡死。
+    now_us = 0;
+    OvCameraWatcher missing;
+    missing.mode_monitor = missing.missing_look = true;
+    missing.monitor_.condition = "举手";
+    missing.RunLoop();
+    assert(missing.session_opens == 2 && missing.second_open_at >= 6000000);
+    assert(missing.monitor_.condition == "举手");
+    assert(std::count(missing.events.begin(), missing.events.end(), "accepted") == 2);
+    assert(std::count(missing.events.begin(), missing.events.end(), "answer") == 1);
     for (bool before_first_frame : {false, true}) {
         now_us = 0;
         OvCameraWatcher current;
@@ -408,6 +521,7 @@ int main() {
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "cJSON.h"
 constexpr size_t kMaxResultReplyBytes = 96 * 1024;
 enum HttpMethod { HTTP_METHOD_GET };
@@ -444,7 +558,9 @@ int main() {
         {6, 200, R"({"results":[{"seq":7,"type":"closed"}]})"},
         {6, 404, R"({"detail":"not found"})"},
         {6, 200, R"({"results":[{"seq":7,"type":"answer","status":"watch_accepted","text":"提醒开启"}]})"},
-        {6, 200, R"({"results":[{"type":"answer","status":"ok","text":"缺少序号"}]})"}
+        {7, 200, R"({"results":[{"type":"answer","status":"ok","text":"缺少序号"}]})"},
+        {7, 200, R"({"results":[{"seq":8,"type":"answer","status":"model_report","text":"旧监控"},{"seq":9,"type":"answer","status":"watch_accepted","text":"已开启"},{"seq":10,"type":"answer","status":"model_report","text":"命中"}]})"},
+        {10, 200, R"({"results":[{"seq":11,"type":"answer","status":"model_report","text":"另一次命中"},{"seq":12,"type":"answer","status":"ok","text":"单次回答","source_window_s":[10,11]}]})"}
     };
     assert(w.CollectResults(http, cursor, match).value().empty() && cursor == 2);
     assert(w.CollectResults(http, cursor, match).value() == "蓝色" && cursor == 3 && match.status == "ok");
@@ -452,11 +568,18 @@ int main() {
     assert(w.CollectResults(http, cursor, match) && cursor == 5 && match.status == "missing_evidence");
     assert(!w.CollectResults(http, cursor, match) && cursor == 5);
     assert(w.CollectResults(http, cursor, match).value() == "流丢失" && cursor == 6 && match.status == "stream_unavailable");
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         match.status.clear();
         assert(w.CollectResults(http, cursor, match) && match.status == "stream_unavailable" && cursor == 6);
     }
-    assert(!w.CollectResults(http, cursor, match) && cursor == 6 && replies.empty());
+    assert(w.CollectResults(http, cursor, match) && match.status == "unexpected_watch" && cursor == 7);
+    assert(!w.CollectResults(http, cursor, match) && cursor == 7);
+    match = {0}; match.query_pending = false; match.monitor_registering = true;
+    assert(w.CollectResults(http, cursor, match).value().empty());
+    assert(match.monitor_accepted && cursor == 10 && match.reports.size() == 1 && match.reports[0].first == 10);
+    match = {11};
+    assert(w.CollectResults(http, cursor, match).value() == "单次回答");
+    assert(match.reports.size() == 1 && match.reports[0].first == 11 && cursor == 12 && replies.empty());
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

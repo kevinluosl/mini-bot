@@ -8,6 +8,7 @@
 #include "system_info.h"
 
 #include <algorithm>
+#include <cJSON.h>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -290,27 +291,47 @@ private:
         mcp.AddTool("self.camera.start_watch",
                     "开始持续上传画面，无需参数。不自动生成画面描述；之后用 look_current 看当下，或用 look_past 回看。",
                     PropertyList(),
-                    [this](const PropertyList&) -> ReturnValue {
+                    [this](const PropertyList&) -> ToolResult {
                         if (camera_ == nullptr || !camera_ready_) {
-                            return std::string("摄像头未就绪，无法开始观察");
+                            return std::unexpected("摄像头未就绪，无法开始观察");
                         }
                         if (auto r = camera_->Start(); !r) {
-                            return "开始观察失败: " + r.error();
+                            return std::unexpected("开始观察失败: " + r.error());
                         }
-                        return std::string("已启动持续观察");
+                        return ReturnValue(std::string("已启动持续观察"));
                     });
 
         mcp.AddTool("self.camera.stop_watch",
                     "停止持续观察画面，后台关闭视觉网关会话。"
                     "用户说“不用看了”“关上眼睛”时调用。",
                     PropertyList(),
-                    [this](const PropertyList&) -> ReturnValue {
+                    [this](const PropertyList&) -> ToolResult {
                         if (camera_ == nullptr) {
-                            return std::string("摄像头未就绪");
+                            return std::unexpected("摄像头未就绪");
                         }
                         camera_->Stop();
-                        return std::string("已请求停止观察，不再接受画面查询");
+                        return ReturnValue(std::string("已请求停止观察和监控提醒，不再接受画面查询"));
                     });
+
+        mcp.AddTool(std::make_unique<McpTool>("self.camera.start_monitor",
+            "用户说‘看到某情况时提醒我’才开启持续监控提醒；不是问当前或过去。自动开启上传画面，"
+            "只在命中后提醒，直到用 stop_monitor 停用；不要创建周期定时任务。默认启用否定静默。",
+            PropertyList({Property("condition", kPropertyTypeString),
+                          Property("silent_if_negative", kPropertyTypeBoolean, true)}),
+            [this](const PropertyList& args) -> ToolResult {
+                if (!camera_ || !camera_ready_) return std::unexpected("摄像头未就绪");
+                auto result = camera_->StartMonitor(args["condition"].value<std::string>(),
+                                                    args["silent_if_negative"].value<bool>());
+                if (!result) return std::unexpected(result.error());
+                return ReturnValue(std::string("已请求启用监控提醒，等待网关确认；尚未检测到目标。"));
+            }));
+        mcp.AddTool(std::make_unique<McpTool>("self.camera.stop_monitor",
+            "关闭监控提醒，不停止持续上传。用户只要求取消提醒时调用。",
+            PropertyList(), [this](const PropertyList&) -> ToolResult {
+                if (!camera_ || !camera_ready_) return std::unexpected("摄像头未就绪");
+                camera_->StopMonitor();
+                return ReturnValue(std::string("已停用监控提醒，持续观察状态不变。"));
+            }));
 
         // 只给当前画面工具开放自定义 question；回看继续使用板端固定问题。
         // 非 ok 以工具错误返回，服务端不拿它做有人判断，也不当画面线索。
@@ -1153,6 +1174,22 @@ public:
         return &audio_codec;
     }
 
+    std::string GetDeviceStatusJson() override {
+        auto base = WifiBoard::GetDeviceStatusJson();
+        auto root = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>(cJSON_Parse(base.c_str()), cJSON_Delete);
+        if (!root) return base;
+        auto* camera = cJSON_AddObjectToObject(root.get(), "camera");
+        if (!camera) return base;
+        const bool watching = camera_ && camera_->IsWatching();
+        const auto monitor = camera_ ? camera_->GetMonitorStatus() : OvCameraWatcher::MonitorStatus{};
+        cJSON_AddBoolToObject(camera, "observation_enabled", watching);
+        cJSON_AddBoolToObject(camera, "monitor_enabled", watching && !monitor.condition.empty());
+        cJSON_AddBoolToObject(camera, "monitor_ready", watching && monitor.ready);
+        cJSON_AddStringToObject(camera, "monitor_condition", monitor.condition.c_str());
+        cJSON_AddBoolToObject(camera, "silent_if_negative", monitor.silent_if_negative);
+        auto json = std::unique_ptr<char, decltype(&cJSON_free)>(cJSON_PrintUnformatted(root.get()), cJSON_free);
+        return json ? std::string(json.get()) : base;
+    }
     Display* GetDisplay() override { return display_; }
 
     // 供 McpServer 注册标准工具 self.camera.take_photo。

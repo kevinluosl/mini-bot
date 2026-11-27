@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <freertos/FreeRTOS.h>
@@ -33,6 +34,14 @@ public:
     bool IsReady() const { return initialized_; }
 
     std::expected<void, std::string> Start();
+    std::expected<void, std::string> StartMonitor(const std::string& condition, bool silent_if_negative);
+    void StopMonitor();
+    struct MonitorStatus {
+        std::string condition;
+        bool silent_if_negative = true;
+        bool ready = false;
+    };
+    MonitorStatus GetMonitorStatus() const;
     // 立即停止接收观察请求；正在执行的 I/O 和会话清理由观察任务完成。
     void Stop();
     bool IsWatching() const { return watching_; }
@@ -58,6 +67,13 @@ public:
 private:
     static constexpr int kMaxAnswers = 5;
 
+    std::expected<void, std::string> StartLocked();
+    void SetMonitor(MonitorStatus settings);
+    mutable std::mutex monitor_mutex_;
+    MonitorStatus monitor_;
+    std::atomic<uint32_t> monitor_revision_{0};
+    void PublishMonitorEvent(const std::string& id, int seq, const std::string& text,
+                             const MonitorStatus& settings);
     static void TaskEntry(void* arg);
     void RunLoop();
 
@@ -82,7 +98,8 @@ private:
     // LookCurrent / LookPast 共用：提一次问题，把非 ok 结果转成工具错误。
     std::expected<std::string, std::string> LookOnce(const std::string& question, const char* time_scope,
                                                       std::string* session_id = nullptr);
-    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us);
+    void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us,
+                     const uint32_t* monitor_revision = nullptr);
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
     std::shared_ptr<ViewRequest> pending_;
@@ -90,6 +107,7 @@ private:
                     const std::string& status);
     std::expected<void, std::string> SendQuestion(OvHttpClient& http, const std::string& question, double t_sec,
                                                   const std::string& time_scope);
+    std::expected<void, std::string> ClearWatch(OvHttpClient& http);
     void CloseSession(OvHttpClient& http);
     struct CapturedFrame {
         std::string jpeg;
@@ -102,6 +120,10 @@ private:
         double question_t;
         int result_seq = 0;
         std::string status;
+        bool query_pending = true;
+        bool monitor_registering = false;
+        bool monitor_accepted = false;
+        std::vector<std::pair<int, std::string>> reports;
     };
     std::expected<std::string, std::string> CollectResults(OvHttpClient& http, int& after, AnswerMatch& match);
 

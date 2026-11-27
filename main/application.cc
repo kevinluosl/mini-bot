@@ -955,10 +955,10 @@ void Application::SendMcpMessage(const std::string& payload) {
     });
 }
 
-void Application::SendServerMcpNotification(const std::string& payload) {
-    const auto can_notify = [this]() {
+void Application::SendServerMcpNotification(const std::string& payload, bool idle_only) {
+    const auto can_notify = [this, idle_only]() {
         const auto state = GetDeviceState();
-        return state == kDeviceStateIdle || state == kDeviceStateListening;
+        return !idle_only || state == kDeviceStateIdle || state == kDeviceStateListening;
     };
     // 触发时忙就直接丢弃；入队后若开始说话，也不能迟到插话。
     if (!can_notify()) return;
