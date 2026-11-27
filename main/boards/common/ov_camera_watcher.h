@@ -64,7 +64,6 @@ private:
         std::string question;
         std::string reply;
         std::chrono::steady_clock::time_point deadline;
-        bool current_only = false;
         std::string time_scope = "auto";
         // 采样任务在完成时写入网关 status，LookOnce 据此区分正常回答和工具错误。
         std::string status;
@@ -75,7 +74,7 @@ private:
         std::string status;  // 空表示本地失败（超时、未观察、忙）
         std::string session_id = {};
     };
-    ViewReply RequestView(const std::string& question, bool current_only, const std::string& time_scope,
+    ViewReply RequestView(const std::string& question, const std::string& time_scope,
                           std::chrono::steady_clock::time_point deadline);
     // LookCurrent / LookPast 共用：提一次问题，把非 ok 结果转成工具错误。
     std::expected<std::string, std::string> LookOnce(const std::string& question, const char* time_scope,
@@ -98,18 +97,10 @@ private:
     std::expected<std::optional<double>, std::string> PushOneFrame(int64_t session_start_us);
     struct AnswerMatch {
         double question_t;
-        double frame_t;
-        bool current_only = false;
-        int question_log_seq = 0;
         int result_seq = 0;
-        std::string task_template;
         std::string status;
     };
-    // 当前画面按结果游标取答；诊断事件只用于现有的回看和自动范围校验。
-    std::expected<std::string, std::string> CollectCurrentResult(int& after, AnswerMatch& match);
-    std::expected<std::string, std::string> CollectResults(int& logs_after, AnswerMatch& match);
-    static bool ReadAnswerLogPage(const std::string& body, int& after, AnswerMatch& match);
-    static std::expected<std::string, std::string> SelectAnswer(const std::string& body, const AnswerMatch& match);
+    std::expected<std::string, std::string> CollectResults(int& after, AnswerMatch& match);
 
     void AddAnswer(const std::string& text);
 
@@ -124,10 +115,9 @@ private:
     std::atomic<bool> task_running_{false};
     std::mutex lifecycle_mutex_;
 
-    // 会话 ID 和诊断凭据受 session_mutex_ 保护，令牌不写入日志或 URL。
+    // 会话 ID 受 session_mutex_ 保护，API Key 不写入日志或 URL。
     mutable std::mutex session_mutex_;
     std::string session_id_;
-    std::string logs_token_;
 
     // 答案环形缓冲，受 answers_mutex_ 保护。
     mutable std::mutex answers_mutex_;

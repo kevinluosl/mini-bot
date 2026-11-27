@@ -1,10 +1,17 @@
 menu "Mini-Bot"
 
 config MINI_BOT_OV_BASE_URL
-    string "OV vision gateway base URL"
+    string "OV HTTPS vision gateway base URL"
     default ""
     help
         Leave empty to disable cloud observation until a gateway is configured.
+
+config MINI_BOT_OV_API_KEY
+    string "OV vision gateway API key"
+    default ""
+    help
+        For a private build, set this only in the ignored sdkconfig.local.defaults.
+        The key is embedded in the firmware; never distribute a build containing it.
 
 config OTA_URL
     string "Default OTA URL"

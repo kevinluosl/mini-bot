@@ -2,9 +2,8 @@
 #include "application.h"
 
 #include <cJSON.h>
-#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-#include <esp_crt_bundle.h>
-#endif
+
+extern const char ov_gateway_cert_pem_start[] asm("_binary_ov_gateway_cert_pem_start");
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
@@ -39,18 +38,20 @@ struct OvHttpReply {
 std::expected<OvHttpReply, std::string> RequestOv(
     const std::string& url, esp_http_client_method_t method, int timeout_ms,
     size_t reply_limit = kMaxControlReplyBytes, std::string_view content_type = {},
-    std::string_view body = {}, const char* logs_token = nullptr) {
+    std::string_view body = {}) {
+    // 所有操作（含查询与 DELETE）在同一 TLS 信任边界内发送凭据。
+    // 这里再检查协议，防止未来任何调用点把 Key 发到明文端点。
+    if (!url.starts_with("https://")) return std::unexpected("OV 网关必须使用 HTTPS");
+    const std::string authorization = std::string("Bearer ") + CONFIG_MINI_BOT_OV_API_KEY;
     OvHttpReply reply;
     reply.limit = reply_limit;
     esp_http_client_config_t config{};
     config.url = url.c_str();
     config.method = method;
     config.timeout_ms = timeout_ms;
-    // 不跟随重定向，避免问答诊断凭据被带到其他地址。
+    // 仅信任随固件分发的网关证书，保留 TLS 的主机名/IP 校验，不转发凭据到重定向地址。
     config.disable_auto_redirect = true;
-#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-#endif
+    config.cert_pem = ov_gateway_cert_pem_start;
     config.user_data = &reply;
     config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
         if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
@@ -68,7 +69,7 @@ std::expected<OvHttpReply, std::string> RequestOv(
         esp_http_client_init(&config), esp_http_client_cleanup);
     if (!client) return std::unexpected("创建 OV HTTP 客户端失败");
     if ((!content_type.empty() && esp_http_client_set_header(client.get(), "Content-Type", content_type.data()) != ESP_OK) ||
-        (logs_token && esp_http_client_set_header(client.get(), "X-Session-Log-Token", logs_token) != ESP_OK) ||
+        esp_http_client_set_header(client.get(), "Authorization", authorization.c_str()) != ESP_OK ||
         (!body.empty() && (body.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
                           esp_http_client_set_post_field(client.get(), body.data(), static_cast<int>(body.size())) != ESP_OK))) {
         return std::unexpected("设置 OV HTTP 请求失败");
@@ -90,20 +91,20 @@ void LogWatchHeap() {
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
-// QA 有在途问题时才查诊断与结果，使用短请求以免阻塞下一帧。
+// 仅在有在途问题时轮询结果，避免长轮询阻塞推帧。
 constexpr int kResultReadTimeoutMs = 1500;
+// 文档规定当前帧最多早于问题 2.5 秒；预留 0.5 秒给请求传输。
+constexpr double kCurrentFrameMaxAgeSec = 2.0;
+constexpr const char* kSessionExpired = "OV 观察会话已关闭";
 constexpr size_t kMaxAnswerBytes = 4096;
 constexpr int kViewTimeoutSec = 20;
 constexpr const char* kDefaultQuestion = "详细描述画面内容";
 // look_current 聚焦人物活动和可能的情绪，要求短答；内部 GetView 的通用问题不变。
 constexpr const char* kLookCurrentQuestion = "画面中是否有人，如果有人简洁描述他在干什么，以及可能的情绪，不超过30个字";
-// look_past 只问 OV 一次回看（time_scope=past）。会话最多保留 60 帧、每秒一帧，约一分钟。
+// look_past 只问 OV 一次回看（time_scope=past）；实际可回看范围由网关决定。
 // 明确要求无人时只答“没有人”，服务端按完整短句静默；有没有人仍由服务端 Jev 兜底判断，板端不解析。
 constexpr const char* kLookPastQuestion = "总结过去一分钟画面前的人在做什么？如果没有人，就回答没有人。";
-constexpr const char* kLookStreamLost = "没拿到画面：流式会话不可用，已重新建立观察会话，请稍后再看";
-// 板端发送微秒精度的会话时间，仅容许 JSON 数字转换的亚微秒误差。
-constexpr double kTimestampToleranceSec = 0.00000051;
-
+constexpr const char* kLookStreamLost = "没拿到画面：流式会话不可用，请稍后再看";
 int ReadSequence(const cJSON* object, const char* key) {
     const auto* value = cJSON_GetObjectItemCaseSensitive(object, key);
     if (!cJSON_IsNumber(value)) return -1;
@@ -113,59 +114,11 @@ int ReadSequence(const cJSON* object, const char* key) {
     return static_cast<int>(number);
 }
 
-struct EvidenceWindow {
-    double first;
-    double last;
-};
-
-std::optional<EvidenceWindow> ReadEvidenceWindow(const cJSON* item, const char* key) {
-    const auto* window = cJSON_GetObjectItemCaseSensitive(item, key);
-    if (!cJSON_IsArray(window) || cJSON_GetArraySize(window) != 2) return std::nullopt;
-    const auto* first = cJSON_GetArrayItem(window, 0);
-    const auto* last = cJSON_GetArrayItem(window, 1);
-    if (!cJSON_IsNumber(first) || !cJSON_IsNumber(last) ||
-        !std::isfinite(first->valuedouble) || !std::isfinite(last->valuedouble) ||
-        first->valuedouble < 0 || last->valuedouble < first->valuedouble) return std::nullopt;
-    return EvidenceWindow{first->valuedouble, last->valuedouble};
-}
-
 std::string_view TextField(const cJSON* item, const char* key) {
     const auto* value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(item, key));
     return value ? value : "";
 }
 
-bool IsAnswerError(std::string_view status) {
-    return status == "insufficient_evidence" || status == "busy" || status == "stream_unavailable" ||
-           status == "vision_timeout" || status == "vision_queue_timeout" ||
-           status == "vision_release_unconfirmed" || status == "clarification" ||
-           status == "ambiguous_reference" || status == "invalid_visual_format";
-}
-
-bool HasValidEvidence(const cJSON* item, double frame_t, double question_t, std::string_view type,
-                      bool from_results) {
-    const auto source = ReadEvidenceWindow(item, "source_window_s");
-    if (!source) return false;
-    if (type == "current_qa_v1") {
-        return source->first >= frame_t - kTimestampToleranceSec &&
-               source->last <= question_t + kTimestampToleranceSec;
-    }
-    const bool history = type == "history_history_v1" || type == "history_replay_v1" ||
-                         type == "history_inventory_v1" || type == "history_attribute_v1" ||
-                         type == "history_action_count_v1" || type == "history_appearance_count_v1";
-    if (!history) return false;
-    // 未指定时段的流式回看会一直读到作答时刻，19200 实测取证终点比提问晚约 1 秒。
-    // 超出本轮等待上限的证据不可能属于本轮问题。
-    if (source->last > question_t + kViewTimeoutSec) return false;
-    // 诊断页只有实际取证窗口；已关联的回看答案还须在结果页核对请求窗口。
-    if (!from_results) return true;
-    const auto requested = ReadEvidenceWindow(item, "requested_window_s");
-    if (!requested || source->first < requested->first - kTimestampToleranceSec ||
-        source->last > requested->last + kTimestampToleranceSec) return false;
-    // 指定时段的回看：请求窗口在提问前结束，证据落在请求窗口内即可。
-    if (requested->last <= question_t + kTimestampToleranceSec) return true;
-    // 流式回看：请求窗口随流延伸到作答时刻，必须覆盖本轮确认的新帧，排除旧的总结。
-    return TextField(item, "coverage") == "stream" && source->last >= frame_t - kTimestampToleranceSec;
-}
 }  // namespace
 
 OvCameraWatcher::OvCameraWatcher(const camera_config_t& config,
@@ -192,7 +145,7 @@ bool OvCameraWatcher::Initialize() {
         return false;
     }
     initialized_ = true;
-    ESP_LOGI(kTag, "摄像头就绪，网关=%s", base_url_.c_str());
+    ESP_LOGI(kTag, "摄像头就绪");
     return true;
 }
 
@@ -205,8 +158,14 @@ std::expected<void, std::string> OvCameraWatcher::Start() {
     if (task_running_) {
         return std::unexpected("上次观察尚在关闭，请稍后再开启");
     }
-    if (base_url_.empty()) {
-        return std::unexpected("未配置 OV 网关地址");
+    if (base_url_.empty()) return std::unexpected("未配置 OV 网关地址");
+    if (!base_url_.starts_with("https://") || base_url_.size() <= sizeof("https://") - 1 ||
+        base_url_.find_first_of("@?#\r\n\t ") != std::string::npos) {
+        return std::unexpected("OV 网关必须使用不带凭据、查询或片段的 HTTPS 地址");
+    }
+    constexpr std::string_view key = CONFIG_MINI_BOT_OV_API_KEY;
+    if (key.empty() || key.find_first_of("\r\n\t ") != std::string_view::npos) {
+        return std::unexpected("未配置有效的 OV API Key");
     }
 
     // 清空上一轮的答案，避免"这次打开"却夹着上次的内容。
@@ -217,7 +176,6 @@ std::expected<void, std::string> OvCameraWatcher::Start() {
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         session_id_.clear();
-        logs_token_.clear();
     }
 
     watching_ = true;
@@ -301,7 +259,7 @@ void OvCameraWatcher::RunLoop() {
     int64_t next_frame_us = start_us, next_poll_us = 0;
     std::shared_ptr<ViewRequest> active;
     AnswerMatch match{};
-    int logs_after = 0, result_after = 0;
+    int result_after = 0;
     int consecutive_failures = 0;
     std::optional<double> latest_frame;
     bool stream_lost = false;
@@ -326,33 +284,34 @@ void OvCameraWatcher::RunLoop() {
                 break;
             }
             active.reset();
-            logs_after = result_after = consecutive_failures = 0;
+            result_after = consecutive_failures = 0;
             latest_frame.reset();
             start_us = next_frame_us = esp_timer_get_time();
         }
 
         const auto submit = [&](double frame_t) {
+            const double question_t = (esp_timer_get_time() - start_us) / 1000000.0;
+            if (requested->time_scope == "current" && question_t - frame_t >= kCurrentFrameMaxAgeSec) return;
             {
                 std::lock_guard<std::mutex> guard(request_mutex_);
-                if (!watching_ || !requested || active || pending_ != requested ||
+                if (!watching_ || active || pending_ != requested ||
                     std::chrono::steady_clock::now() >= requested->deadline) return;
                 active = requested;
             }
-            match = {(esp_timer_get_time() - start_us) / 1000000.0, frame_t, requested->current_only};
+            match = {question_t};
             if (auto r = SendQuestion(active->question, match.question_t, active->time_scope); !r) {
                 // 保留 active，等待线程收到错误后，下一次循环隔离旧会话。
                 FinishView(active, "发送画面问题失败：" + r.error(), "");
             }
             next_poll_us = esp_timer_get_time();
         };
-        const auto poll = [&](bool current) {
+        const auto poll = [&] {
             if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;
-            auto answer = current ? CollectCurrentResult(result_after, match) : CollectResults(logs_after, match);
+            auto answer = CollectResults(result_after, match);
             next_poll_us = esp_timer_get_time() + kPollIntervalUs;
             if (!answer) {
                 ESP_LOGW(kTag, "OV 拉取结果失败: %s", answer.error().c_str());
             } else if (!answer->empty() && FinishView(active, *answer, match.status)) {
-                if (match.result_seq > result_after) result_after = match.result_seq;
                 ESP_LOGI(kTag, "OV answer seq=%d elapsed_ms=%lld", match.result_seq,
                          static_cast<long long>((esp_timer_get_time() - start_us) / 1000 - match.question_t * 1000));
                 if (match.status == "ok") AddAnswer(*answer);
@@ -364,7 +323,7 @@ void OvCameraWatcher::RunLoop() {
         const bool wants_current = requested && requested->time_scope == "current";
         if (!active && wants_current && latest_frame) submit(*latest_frame);
         // 用独立的短轮询节拍取答，不使用会卡住推帧的长轮询。
-        if (active && active == requested && active->time_scope == "current" &&
+        if (active && active == requested &&
             esp_timer_get_time() >= next_poll_us) {
             // 提交失败会清掉 pending；不要再查可能已进入旧会话的结果。
             bool still_pending;
@@ -372,14 +331,17 @@ void OvCameraWatcher::RunLoop() {
                 std::lock_guard<std::mutex> guard(request_mutex_);
                 still_pending = pending_ == active;
             }
-            if (still_pending) poll(true);
+            if (still_pending) poll();
         }
         if (watching_ && !stream_lost && esp_timer_get_time() >= next_frame_us) {
             next_frame_us = esp_timer_get_time() + kFrameIntervalMs * 1000LL;
             auto frame = PushOneFrame(start_us);
             if (!frame) {
                 ESP_LOGW(kTag, "本轮失败: %s", frame.error().c_str());
-                if (++consecutive_failures >= kMaxFailures) {
+                if (frame.error() == kSessionExpired) {
+                    if (active) FinishView(active, kSessionExpired, "stream_unavailable");
+                    stream_lost = true;
+                } else if (++consecutive_failures >= kMaxFailures) {
                     watching_ = false;
                     break;
                 }
@@ -387,11 +349,10 @@ void OvCameraWatcher::RunLoop() {
                 consecutive_failures = 0;
                 if (frame->has_value()) latest_frame = **frame;
             }
-            if (active && active == requested && active->time_scope != "current") poll(false);
             if (!active && requested && frame && frame->has_value()) submit(**frame);
         }
         int64_t wake_us = next_frame_us;
-        if (active && active->time_scope == "current" && next_poll_us < wake_us) wake_us = next_poll_us;
+        if (active && next_poll_us < wake_us) wake_us = next_poll_us;
         if (!stream_lost) WaitForWork(requested, wake_us);
     }
 
@@ -410,12 +371,12 @@ void OvCameraWatcher::RunLoop() {
 
 std::expected<void, std::string> OvCameraWatcher::OpenSession() {
     // 实际摄像头帧率与每秒一次的上传节拍不是同一个概念。
-    // 每秒一帧时保留 60 帧、超出后压到 45 帧：“刚才”约覆盖 45–60 秒。
-    constexpr auto payload = R"({"input_mode":"live","mode":"qa","fps":30.0,"answer_memory":false,"max_visual_frames":60,"compact_to_visual_frames":45})";
+    // 只发送公开参数，历史保留策略由网关决定。
+    constexpr auto payload = R"({"input_mode":"live","mode":"qa","fps":30.0})";
     auto response = RequestOv(base_url_ + "/v1/glasses/sessions", HTTP_METHOD_POST,
                               kHttpTimeoutMs, kMaxControlReplyBytes, "application/json", payload);
     if (!response) return std::unexpected("连接网关失败: " + response.error());
-    if (response->status != 200 && response->status != 201) {
+    if (response->status != 201) {
         // 建会话响应可能包含凭据，任何分支都不要记录原始正文。
         return std::unexpected("建会话 HTTP " + std::to_string(response->status));
     }
@@ -428,27 +389,15 @@ std::expected<void, std::string> OvCameraWatcher::OpenSession() {
         return std::unexpected("建会话响应缺少有效的 session_id");
     }
 
-    const auto token = TextField(root.get(), "logs_token");
-    const auto logs_path = TextField(root.get(), "logs_url");
-    bool valid_token = !token.empty();
-    for (const unsigned char ch : token) {
-        if (ch < 0x21 || ch > 0x7e) valid_token = false;
-    }
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         session_id_ = sid;
     }
-    // 只允许已知的同源路径，避免把凭据发往响应中指定的其他地址。
-    if (TextField(root.get(), "mode") != "qa" || !valid_token ||
-        logs_path != "/v1/glasses/sessions/" + sid + "/logs") {
+    if (TextField(root.get(), "mode") != "qa") {
         CloseSession();
-        return std::unexpected("OV 未返回有效的 QA 会话诊断凭据");
+        return std::unexpected("OV 未建立 QA 会话");
     }
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        logs_token_ = token;
-    }
-    ESP_LOGI(kTag, "会话已建立: %s (qa, fps=30, 回看 60/45 帧)", sid.c_str());
+    ESP_LOGI(kTag, "会话已建立: %s (qa, fps=30)", sid.c_str());
     return {};
 }
 
@@ -457,7 +406,6 @@ void OvCameraWatcher::CloseSession() {
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         sid.swap(session_id_);
-        logs_token_.clear();
     }
     if (sid.empty()) return;
 
@@ -477,7 +425,7 @@ bool OvCameraWatcher::IsValidTimeScope(const std::string& time_scope) {
 std::string OvCameraWatcher::GetView(const std::string& question, const std::string& time_scope) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kViewTimeoutSec);
     // 未知取值按默认看当下，避免把模型自造的参数传给网关。
-    return RequestView(question, false, IsValidTimeScope(time_scope) ? time_scope : "current", deadline).text;
+    return RequestView(question, IsValidTimeScope(time_scope) ? time_scope : "current", deadline).text;
 }
 
 std::expected<std::string, std::string> OvCameraWatcher::LookCurrent(const std::string& question,
@@ -498,7 +446,7 @@ std::expected<std::string, std::string> OvCameraWatcher::LookOnce(const std::str
     if (session_id) session_id->clear();
     // 实时优先：一次 look 只向 OV 提一个问题，最多等 20 秒。
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kViewTimeoutSec);
-    auto reply = RequestView(question, false, time_scope, deadline);
+    auto reply = RequestView(question, time_scope, deadline);
     if (reply.status == "ok") {
         if (session_id) *session_id = std::move(reply.session_id);
         return std::move(reply.text);
@@ -508,15 +456,13 @@ std::expected<std::string, std::string> OvCameraWatcher::LookOnce(const std::str
     return std::unexpected(reply.text.empty() ? "没拿到画面" : reply.text);
 }
 
-OvCameraWatcher::ViewReply OvCameraWatcher::RequestView(const std::string& question, bool current_only,
-                                                         const std::string& time_scope,
+OvCameraWatcher::ViewReply OvCameraWatcher::RequestView(const std::string& question, const std::string& time_scope,
                                                          std::chrono::steady_clock::time_point deadline) {
     std::unique_lock<std::mutex> lock(request_mutex_);
     if (!watching_) return {"摄像头没有启动观察", ""};
     if (pending_) return {"正在等待上一个画面问题的答案", ""};
     auto request = std::make_shared<ViewRequest>();
     request->deadline = deadline;
-    request->current_only = current_only;
     request->time_scope = time_scope;
     request->question = question.find_first_not_of(" \t\r\n") == std::string::npos ? kDefaultQuestion : question;
     pending_ = request;
@@ -609,6 +555,7 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     auto response = RequestOv(session_path + path, HTTP_METHOD_POST, kHttpTimeoutMs,
                               kMaxControlReplyBytes, "image/jpeg", frame->jpeg);
     if (!response) return std::unexpected("推帧失败: " + response.error());
+    if (response->status == 404) return std::unexpected(kSessionExpired);
     if (response->status != 200) {
         return std::unexpected("推帧 HTTP " + std::to_string(response->status));
     }
@@ -617,78 +564,14 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     std::unique_ptr<cJSON, decltype(&cJSON_Delete)> reply(cJSON_Parse(response->body.c_str()), cJSON_Delete);
     const auto* accepted = cJSON_GetObjectItem(reply.get(), "accepted");
     if (cJSON_IsTrue(accepted)) return t_sec;
-    const auto reason = TextField(reply.get(), "reason");
-    if (cJSON_IsFalse(accepted) && (reason == "live_1hz_sampling" || reason == "live_wall_rate")) {
+    if (cJSON_IsFalse(accepted)) {
         ESP_LOGD(kTag, "OV frame skipped t=%.6f", t_sec);
         return std::nullopt;
     }
-    return std::unexpected("OV 未确认接收推帧: " + std::string(reason.empty() ? "未返回接收原因" : reason));
+    return std::unexpected("OV 推帧响应缺少 accepted");
 }
 
-bool OvCameraWatcher::ReadAnswerLogPage(const std::string& body, int& after, AnswerMatch& match) {
-    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(body.c_str()), cJSON_Delete);
-    const int next_after = ReadSequence(root.get(), "next_after");
-    const auto* events = cJSON_GetObjectItemCaseSensitive(root.get(), "events");
-    if (next_after < after || !cJSON_IsArray(events)) return false;
-    const cJSON* event = nullptr;
-    cJSON_ArrayForEach(event, events) {
-        const int log_seq = ReadSequence(event, "log_seq");
-        if (log_seq <= after || log_seq > next_after) continue;
-        const auto type = TextField(event, "event");
-        if (type == "question" && match.question_log_seq == 0) {
-            const auto* t = cJSON_GetObjectItemCaseSensitive(event, "question_t");
-            if (cJSON_IsNumber(t) && std::abs(t->valuedouble - match.question_t) < kTimestampToleranceSec) {
-                match.question_log_seq = log_seq;
-            }
-        } else if (type == "answer" && match.question_log_seq > 0 &&
-                   ReadSequence(event, "question_log_seq") == match.question_log_seq) {
-            const int seq = ReadSequence(event, "seq");
-            const auto task = TextField(event, "task_template");
-            const auto status = TextField(event, "status");
-            // 异步提醒或持续计数不是单次问答回包。
-            if (seq <= match.result_seq || task == "event_alert_v1" || task == "cumulative_count_v1" ||
-                task == "cancel_live_task" || status == "watch_accepted" || status == "model_report") continue;
-            // look 只接受本轮新帧；网关误路由到回看时不能用历史画面决定是否静默。
-            if (status == "ok" && match.current_only && task != "current_qa_v1" && task != "chat") continue;
-            if (status == "ok" && task != "chat" &&
-                !HasValidEvidence(event, match.frame_t, match.question_t, task, false)) continue;
-            match.result_seq = seq;
-            match.task_template = task;
-            match.status = status;
-        }
-    }
-    after = next_after;
-    return true;
-}
-
-std::expected<std::string, std::string> OvCameraWatcher::SelectAnswer(const std::string& body,
-                                                                     const AnswerMatch& match) {
-    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(body.c_str()), cJSON_Delete);
-    const int cursor = ReadSequence(root.get(), "cursor");
-    const auto* results = cJSON_GetObjectItemCaseSensitive(root.get(), "results");
-    if (cursor < 0 || !cJSON_IsArray(results)) return std::unexpected("OV 结果页格式异常");
-    if (match.result_seq <= 0 || cursor < match.result_seq) return std::string{};
-    const cJSON* item = nullptr;
-    cJSON_ArrayForEach(item, results) {
-        if (ReadSequence(item, "seq") != match.result_seq || TextField(item, "type") != "answer" ||
-            TextField(item, "task_template") != match.task_template || TextField(item, "status") != match.status) continue;
-        const auto text = TextField(item, "text");
-        if (text.size() > kMaxAnswerBytes || text.find_first_not_of(" \t\r\n") == std::string_view::npos) continue;
-        if (match.status == "ok") {
-            if (match.task_template == "chat") {
-                return "视觉网关未提供画面证据，无法确认这次画面问题。";
-            }
-            if (HasValidEvidence(item, match.frame_t, match.question_t, match.task_template, true)) {
-                return std::string(text);
-            }
-        } else if (IsAnswerError(match.status)) {
-            return std::string(text);
-        }
-    }
-    return std::string{};
-}
-
-std::expected<std::string, std::string> OvCameraWatcher::CollectCurrentResult(int& after, AnswerMatch& match) {
+std::expected<std::string, std::string> OvCameraWatcher::CollectResults(int& after, AnswerMatch& match) {
     std::string sid;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -697,65 +580,71 @@ std::expected<std::string, std::string> OvCameraWatcher::CollectCurrentResult(in
     if (sid.empty()) return std::unexpected("没有有效的 QA 会话");
     auto response = RequestOv(base_url_ + "/v1/glasses/sessions/" + sid +
                               "/results?after=" + std::to_string(after) + "&wait=0", HTTP_METHOD_GET,
-                              kResultReadTimeoutMs, kMaxResultReplyBytes, {}, {}, nullptr);
+                              kResultReadTimeoutMs, kMaxResultReplyBytes);
     if (!response) return std::unexpected(response.error());
+    if (response->status == 404) {
+        match.status = "stream_unavailable";
+        return kSessionExpired;
+    }
     if (response->status != 200) return std::unexpected("读取 OV 回答 HTTP " + std::to_string(response->status));
 
     std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(response->body.c_str()), cJSON_Delete);
-    const int cursor = ReadSequence(root.get(), "cursor");
     const auto* results = cJSON_GetObjectItemCaseSensitive(root.get(), "results");
-    if (cursor < after || !cJSON_IsArray(results)) return std::unexpected("OV 结果页格式异常");
+    if (!cJSON_IsArray(results)) return std::unexpected("OV 结果页格式异常");
+    // /text 不返回可关联的 ID；单问题在途、已读 seq 和超时换会话共同隔离迟到结果。
+    // 结果的 t 是画面时间，不是问题时间。不要用它拒绝正常的历史答案。
+    int newest = after;
     const cJSON* chosen = nullptr;
     const cJSON* item = nullptr;
     cJSON_ArrayForEach(item, results) {
         const int seq = ReadSequence(item, "seq");
+        if (seq < 0) return std::unexpected("OV 结果缺少有效的 seq");
+        if (seq <= after) continue;
+        if (seq > newest) newest = seq;
+        const auto type = TextField(item, "type");
+        if (type == "closed" || type == "error") {
+            match.status = "stream_unavailable";
+            return kSessionExpired;
+        }
         const auto status = TextField(item, "status");
-        const auto text = TextField(item, "text");
-        if (seq <= after || seq > cursor || TextField(item, "type") != "answer" ||
-            TextField(item, "task_template") != "current_qa_v1" || (status != "ok" && !IsAnswerError(status)) ||
-            text.size() > kMaxAnswerBytes || text.find_first_not_of(" \t\r\n") == std::string_view::npos) continue;
-        // 网关不回传问题 ID。单问题会话若出现多个当前答案，不能随意挑一条。
-        if (chosen) return std::unexpected("OV 返回多条当前答案，无法确认归属");
+        if (type != "answer" || status.empty() || status == "model_report") continue;
+        // 建提醒不是视觉答案；也不能让后续提醒混入下一次问答。
+        if (status == "watch_accepted") {
+            match.status = "stream_unavailable";
+            return "观察会话建立了异步提醒，无法继续单次问答";
+        }
+        if (chosen) return std::unexpected("OV 返回多条答案，无法确认归属");
         chosen = item;
     }
     if (!chosen) {
-        after = cursor;
+        after = newest;
         return std::string{};
     }
-    // 提问和取证时序由 harness 负责；不拿结果中的帧时间当作问题时间。
-    match.result_seq = ReadSequence(chosen, "seq");
-    match.status = TextField(chosen, "status");
-    after = cursor;
-    return std::string(TextField(chosen, "text"));
-}
-
-std::expected<std::string, std::string> OvCameraWatcher::CollectResults(int& logs_after, AnswerMatch& match) {
-    std::string sid, token;
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        sid = session_id_;
-        token = logs_token_;
-    }
-    if (sid.empty() || token.empty()) return std::unexpected("没有有效的 QA 会话");
-    const std::string path = base_url_ + "/v1/glasses/sessions/" + sid;
-    const auto fetch = [&](const std::string& suffix, bool diagnostics) -> std::expected<std::string, std::string> {
-        auto response = RequestOv(path + suffix, HTTP_METHOD_GET, kResultReadTimeoutMs,
-                                  kMaxResultReplyBytes, {}, {}, diagnostics ? token.c_str() : nullptr);
-        if (!response) return std::unexpected("读取 OV 回答失败: " + response.error());
-        if (response->status != 200) {
-            return std::unexpected("读取 OV 回答 HTTP " + std::to_string(response->status));
+    const auto text = TextField(chosen, "text");
+    const auto status = TextField(chosen, "status");
+    if (text.size() > kMaxAnswerBytes || text.find_first_not_of(" \t\r\n") == std::string_view::npos) {
+        if (status == "stream_unavailable") {
+            match.status = status;
+            return kSessionExpired;
         }
-        return std::move(response->body);
-    };
-    {
-        auto logs = fetch("/logs?after=" + std::to_string(logs_after) + "&limit=100", true);
-        if (!logs) return std::unexpected(logs.error());
-        if (!ReadAnswerLogPage(*logs, logs_after, match)) return std::unexpected("OV 诊断页格式异常");
+        return std::unexpected("OV 回答正文缺失或过长");
     }
-    if (match.result_seq <= 0) return std::string{};
-    auto results = fetch("/results?after=" + std::to_string(match.result_seq - 1) + "&wait=0", false);
-    if (!results) return std::unexpected(results.error());
-    return SelectAnswer(*results, match);
+    after = newest;
+    match.result_seq = ReadSequence(chosen, "seq");
+    match.status = status;
+    if (status == "ok") {
+        // 文档规定视觉回答才有取证窗口；没有它的闲聊不能当作看到了画面。
+        const auto* window = cJSON_GetObjectItemCaseSensitive(chosen, "source_window_s");
+        const auto* first = cJSON_GetArrayItem(window, 0);
+        const auto* last = cJSON_GetArrayItem(window, 1);
+        if (!cJSON_IsArray(window) || cJSON_GetArraySize(window) != 2 ||
+            !cJSON_IsNumber(first) || !cJSON_IsNumber(last) || !std::isfinite(first->valuedouble) ||
+            !std::isfinite(last->valuedouble) || first->valuedouble < 0 || last->valuedouble < first->valuedouble) {
+            match.status = "missing_evidence";
+            return "视觉网关没有返回可用的画面证据";
+        }
+    }
+    return std::string(text);
 }
 
 void OvCameraWatcher::AddAnswer(const std::string& text) {

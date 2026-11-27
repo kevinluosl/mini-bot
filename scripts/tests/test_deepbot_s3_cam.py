@@ -931,10 +931,10 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIn("xTaskCreatePinnedToCore", source)
 
     def test_camera_gateway_protocol_order(self):
-        """当前画面直接提问并读取结果，回看保留诊断关联。"""
+        """当前画面与回看共用公开 QA 会话接口。"""
         source = (ROOT / "main/boards/common/ov_camera_watcher.cc").read_text(encoding="utf-8")
 
-        for path in ("/v1/glasses/sessions", "/text", "/frame?t=", "/logs?after=", "/results?after=", "DELETE"):
+        for path in ("/v1/glasses/sessions", "/text", "/frame?t=", "/results?after=", "DELETE"):
             self.assertIn(path, source)
 
         # 检查运行路径而非函数定义的排列；启用阶段结束后不得重建会话或重新提问。
@@ -953,16 +953,13 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         config = json.loads(payload.group(1))
         self.assertEqual((config['input_mode'], config['mode'], config['fps']), ('live', 'qa', 30.0))
-        self.assertIs(config['answer_memory'], False)
-        self.assertNotIn('caption_bias', config)
-        # 回看保留 60 帧、压到 45 帧（每秒一帧约 45–60 秒）；两值不能相同。
-        self.assertEqual((config['max_visual_frames'], config['compact_to_visual_frames']), (60, 45))
+        self.assertEqual(set(config), {'input_mode', 'mode', 'fps'})
         self.assertEqual(source.count('SendQuestion('), 2)  # 定义和 look / get_view 共用调用点
         self.assertIn('SendQuestion(active->question, match.question_t, active->time_scope)', frames)
         self.assertIn('cJSON_AddStringToObject(root, "time_scope", time_scope.c_str())', source)
         self.assertIn('if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;', frames)
-        self.assertIn('CollectResults(logs_after, match)', frames)
-        self.assertIn('CollectCurrentResult(result_after, match)', frames)
+        self.assertIn('CollectResults(result_after, match)', frames)
+        self.assertIn('question_t - frame_t >= kCurrentFrameMaxAgeSec', frames)
         self.assertLess(frames.index('if (!active && wants_current && latest_frame)'), frames.index('PushOneFrame(start_us)'))
         self.assertIn('if ((active && active != requested) || stream_lost)', frames)
         # 流式会话失效后必须重建会话，否则同一会话的回看会一直失败。
@@ -1021,18 +1018,22 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         # 会话必须被关闭，避免网关侧会话堆积
         self.assertIn("CloseSession()", source)
 
-        # 诊断关联到本轮后，用目标序号的前一条作为 /results 游标。
+        # 公开接口使用已处理的 seq；不依赖旧网关的诊断通道。
         collect = source.split('OvCameraWatcher::CollectResults(', 1)[1].split('\n}', 1)[0]
-        self.assertIn('diagnostics ? token.c_str() : nullptr', collect)
-        self.assertIn('esp_http_client_set_header(client.get(), "X-Session-Log-Token", logs_token)', source)
-        self.assertLess(collect.index('ReadAnswerLogPage(*logs'), collect.index('"/results?after="'))
-        self.assertIn('std::to_string(match.result_seq - 1)', collect)
+        self.assertIn('"/results?after=" + std::to_string(after) + "&wait=0"', collect)
+        for private_field in ('/logs?', 'X-Session-Log-Token', 'task_template', 'question_log_seq'):
+            self.assertNotIn(private_field, source)
 
-    def test_ov_uses_synchronous_http_with_bounded_response_and_diagnostics(self):
+    def test_ov_uses_verified_https_with_bounded_response_and_diagnostics(self):
         source = (ROOT / "main/boards/common/ov_camera_watcher.cc").read_text()
         http = source.split("std::expected<OvHttpReply, std::string> RequestOv(", 1)[1].split("void LogWatchHeap()", 1)[0]
         self.assertNotIn("CreateHttp(", source)
         self.assertIn("config.disable_auto_redirect = true;", http)
+        self.assertIn('if (!url.starts_with("https://"))', http)
+        self.assertIn('config.cert_pem = ov_gateway_cert_pem_start;', http)
+        self.assertIn('"Authorization", authorization.c_str()', http)
+        self.assertNotIn('skip_cert_common_name_check', http)
+        self.assertNotIn('crt_bundle_attach', http)
         self.assertIn("esp_http_client_init(&config), esp_http_client_cleanup", http)
         self.assertLess(http.index("length > response.limit - response.body.size()"), http.index("response.body.append("))
         self.assertIn("esp_http_client_perform(client.get())", http)
