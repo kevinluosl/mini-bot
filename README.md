@@ -137,7 +137,7 @@ python3 -B verify_startup.py
 
 - 感谢 [小智语音机器人（78/xiaozhi-esp32）](https://github.com/78/xiaozhi-esp32)。语音唤醒、联网和对话链路参考了小智的实现。
 - 感谢 [瓦楞机器人](https://wcnucfj0ewmg.feishu.cn/docx/OpqodJBo4oROIfxO8tUcxvzvn5f)。mini-bot 使用了它的 3D 打印外壳，硬件选型也参考了它的方案。
-- 感谢 [LLaVA-OneVision-2.5](https://github.com/EvolvingLMMs-Lab/LLaVA-OneVision-2.5) 团队开源视觉模型。
+- 感谢[格灵深瞳灵感实验室](https://www.deepglint.com/glintlab)团队开源 [LLaVA-OneVision-2.5](https://github.com/EvolvingLMMs-Lab/LLaVA-OneVision-2.5) 视觉模型。
 
 ## 许可证
 
