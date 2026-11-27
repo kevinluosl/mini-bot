@@ -149,7 +149,7 @@ int main() {
     def test_current_bypasses_frame_tick_and_past_keeps_confirmed_frame(self):
         source = WATCH.read_text()
         loop = source[source.index('void OvCameraWatcher::RunLoop()'):
-                      source.index('std::expected<void, std::string> OvCameraWatcher::OpenSession()')]
+                      source.index('std::expected<void, std::string> OvCameraWatcher::OpenSession(')]
         # Execute the production loop with a deterministic clock and instrumented transport.
         # A question arrives during an upload, followed by a skipped and a failed frame.
         harness = r'''
@@ -187,7 +187,9 @@ struct Application {
     void NotifyToolActivityDone() { ++notifications; }
     unsigned notifications = 0;
 };
+struct OvHttpClient { explicit OvHttpClient(const std::string&) {} };
 struct OvCameraWatcher {
+    std::string base_url_ = "https://unit.test";
     struct ViewRequest { std::string question; std::chrono::steady_clock::time_point deadline;
                          std::string time_scope = "past"; };
     struct AnswerMatch { double question_t; int result_seq = 0; std::string status; };
@@ -213,9 +215,15 @@ struct OvCameraWatcher {
     }
     std::string answer_status = "ok";
     void RunLoop();
-    Result<int> OpenSession() { events.push_back("open"); return {true}; }
-    void CloseSession() { events.push_back("close"); }
-    Result<std::optional<double>> PushOneFrame(int64_t start) {
+    OvHttpClient* transport = nullptr;
+    Result<int> OpenSession(OvHttpClient& http) {
+        if (transport) assert(transport == &http);
+        transport = &http;
+        events.push_back("open");
+        return {true};
+    }
+    void CloseSession(OvHttpClient& http) { assert(transport == &http); events.push_back("close"); }
+    Result<std::optional<double>> PushOneFrame(OvHttpClient& http, int64_t start) { assert(transport == &http);
         if (stale_current && frames == 1) assert(now_us == 2400000);
         else if (!cancel_answer && answer_status == "ok" && !stale_current) {
             assert(now_us == int64_t(frames) * 1000000);
@@ -237,7 +245,7 @@ struct OvCameraWatcher {
         }
         return {true, capture_t};
     }
-    Result<int> SendQuestion(const std::string& question, double t, const std::string& scope) {
+    Result<int> SendQuestion(OvHttpClient& http, const std::string& question, double t, const std::string& scope) { assert(transport == &http);
         events.push_back("ask");
         // 采样任务把请求里的 time_scope 原样交给网关。
         assert(question == "question" && t > capture_t);
@@ -248,7 +256,7 @@ struct OvCameraWatcher {
         } else { assert(scope == "past" && t == 3.05 && frames == 4); }
         return {true};
     }
-    Result<std::string> CollectResults(int& after, AnswerMatch& match) {
+    Result<std::string> CollectResults(OvHttpClient& http, int& after, AnswerMatch& match) { assert(transport == &http);
         ++after;
         if (current) {
             assert(frames == (stale_current ? 2u : 1u));
@@ -362,22 +370,24 @@ enum HttpMethod { HTTP_METHOD_GET };
 struct OvHttpReply { int status; std::string body; };
 struct Reply { int after; int status; std::string body; };
 std::deque<Reply> replies;
-std::expected<OvHttpReply, std::string> RequestOv(
-    const std::string& url, HttpMethod method, int timeout, size_t limit) {
-    assert(method == HTTP_METHOD_GET && timeout == 1500 && limit == kMaxResultReplyBytes);
-    assert(!replies.empty());
-    auto reply = std::move(replies.front()); replies.pop_front();
-    assert(url == "https://unit.test/v1/glasses/sessions/abc/results?after=" +
-                  std::to_string(reply.after) + "&wait=0");
-    return OvHttpReply{reply.status, std::move(reply.body)};
-}
+struct OvHttpClient {
+    std::expected<OvHttpReply, std::string> Request(
+        const std::string& path, HttpMethod method, int timeout, size_t limit) {
+        assert(method == HTTP_METHOD_GET && timeout == 1500 && limit == kMaxResultReplyBytes);
+        assert(!replies.empty());
+        auto reply = std::move(replies.front()); replies.pop_front();
+        assert(path == "/v1/glasses/sessions/abc/results?after=" + std::to_string(reply.after) + "&wait=0");
+        return OvHttpReply{reply.status, std::move(reply.body)};
+    }
+};
 struct OvCameraWatcher {
-    std::string session_id_ = "abc", base_url_ = "https://unit.test";
+    std::string session_id_ = "abc";
     std::mutex session_mutex_;
 '''
         driver = r'''
 int main() {
     OvCameraWatcher w;
+    OvHttpClient http;
     int cursor = 0;
     OvCameraWatcher::AnswerMatch match{11};
     replies = {
@@ -392,17 +402,17 @@ int main() {
         {6, 200, R"({"results":[{"seq":7,"type":"answer","status":"watch_accepted","text":"提醒开启"}]})"},
         {6, 200, R"({"results":[{"type":"answer","status":"ok","text":"缺少序号"}]})"}
     };
-    assert(w.CollectResults(cursor, match).value().empty() && cursor == 2);
-    assert(w.CollectResults(cursor, match).value() == "蓝色" && cursor == 3 && match.status == "ok");
-    assert(w.CollectResults(cursor, match).value() == "没看到画面" && cursor == 4 && match.status == "insufficient_evidence");
-    assert(w.CollectResults(cursor, match) && cursor == 5 && match.status == "missing_evidence");
-    assert(!w.CollectResults(cursor, match) && cursor == 5);
-    assert(w.CollectResults(cursor, match).value() == "流丢失" && cursor == 6 && match.status == "stream_unavailable");
+    assert(w.CollectResults(http, cursor, match).value().empty() && cursor == 2);
+    assert(w.CollectResults(http, cursor, match).value() == "蓝色" && cursor == 3 && match.status == "ok");
+    assert(w.CollectResults(http, cursor, match).value() == "没看到画面" && cursor == 4 && match.status == "insufficient_evidence");
+    assert(w.CollectResults(http, cursor, match) && cursor == 5 && match.status == "missing_evidence");
+    assert(!w.CollectResults(http, cursor, match) && cursor == 5);
+    assert(w.CollectResults(http, cursor, match).value() == "流丢失" && cursor == 6 && match.status == "stream_unavailable");
     for (int i = 0; i < 3; ++i) {
         match.status.clear();
-        assert(w.CollectResults(cursor, match) && match.status == "stream_unavailable" && cursor == 6);
+        assert(w.CollectResults(http, cursor, match) && match.status == "stream_unavailable" && cursor == 6);
     }
-    assert(!w.CollectResults(cursor, match) && cursor == 6 && replies.empty());
+    assert(!w.CollectResults(http, cursor, match) && cursor == 6 && replies.empty());
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

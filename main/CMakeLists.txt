@@ -42,6 +42,7 @@ set(SOURCES
     "boards/common/wifi_board.cc"
     "boards/common/backlight.cc"
     "boards/common/ov_camera_watcher.cc"
+    "boards/common/ov_http_client.cc"
 )
 # 板级目录新增的 .cc 自动参与编译。
 file(GLOB BOARD_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/*.cc)

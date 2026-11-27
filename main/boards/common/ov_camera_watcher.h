@@ -16,6 +16,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+class OvHttpClient;
+
 // 同一传感器供两条独立链路使用：CaptureJpeg 单拍返回独立 JPEG；Start/Stop
 // QA 会话持续推帧，仅在调用 GetView 或 Look 时提问。
 // 两条链路通过 frame_mutex_ 串行取帧，不在持锁期间做网络 I/O。
@@ -59,7 +61,7 @@ private:
     void RunLoop();
 
     // 一整套建会话/插话/推帧/拉结果/关会话的实现
-    std::expected<void, std::string> OpenSession();
+    std::expected<void, std::string> OpenSession(OvHttpClient& http);
     struct ViewRequest {
         std::string question;
         std::string reply;
@@ -85,22 +87,22 @@ private:
     std::shared_ptr<ViewRequest> pending_;
     bool FinishView(const std::shared_ptr<ViewRequest>& request, const std::string& reply,
                     const std::string& status);
-    std::expected<void, std::string> SendQuestion(const std::string& question, double t_sec,
+    std::expected<void, std::string> SendQuestion(OvHttpClient& http, const std::string& question, double t_sec,
                                                   const std::string& time_scope);
-    void CloseSession();
+    void CloseSession(OvHttpClient& http);
     struct CapturedFrame {
         std::string jpeg;
         int64_t captured_us;
     };
     std::expected<CapturedFrame, std::string> CaptureFreshFrame();
     // 返回已被网关接收的帧时间；采样过滤返回空，不能作为提问依据。
-    std::expected<std::optional<double>, std::string> PushOneFrame(int64_t session_start_us);
+    std::expected<std::optional<double>, std::string> PushOneFrame(OvHttpClient& http, int64_t session_start_us);
     struct AnswerMatch {
         double question_t;
         int result_seq = 0;
         std::string status;
     };
-    std::expected<std::string, std::string> CollectResults(int& after, AnswerMatch& match);
+    std::expected<std::string, std::string> CollectResults(OvHttpClient& http, int& after, AnswerMatch& match);
 
     void AddAnswer(const std::string& text);
 

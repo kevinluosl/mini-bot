@@ -1,13 +1,12 @@
 #include "ov_camera_watcher.h"
 #include "application.h"
+#include "ov_http_client.h"
 
 #include <cJSON.h>
-
-extern const char ov_gateway_cert_pem_start[] asm("_binary_ov_gateway_cert_pem_start");
 #include <esp_heap_caps.h>
-#include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <sdkconfig.h>
 
 #include <cmath>
 #include <cstdio>
@@ -25,61 +24,6 @@ constexpr int kFrameIntervalMs = 1000;
 constexpr int64_t kHeapLogIntervalUs = 30000000;
 constexpr size_t kMaxControlReplyBytes = 8 * 1024;
 constexpr size_t kMaxResultReplyBytes = 96 * 1024;
-
-struct OvHttpReply {
-    int status = 0;
-    std::string body;
-    size_t limit = 0;
-    bool too_large = false;
-};
-
-// OV 全部 I/O 已在同一个观察任务中串行执行。使用同步 HTTP，避开第三方
-// EspTcp 的接收任务与客户端销毁竞态；JPEG 由调用者持有，不再拼进一份大请求字符串。
-std::expected<OvHttpReply, std::string> RequestOv(
-    const std::string& url, esp_http_client_method_t method, int timeout_ms,
-    size_t reply_limit = kMaxControlReplyBytes, std::string_view content_type = {},
-    std::string_view body = {}) {
-    // 所有操作（含查询与 DELETE）在同一 TLS 信任边界内发送凭据。
-    // 这里再检查协议，防止未来任何调用点把 Key 发到明文端点。
-    if (!url.starts_with("https://")) return std::unexpected("OV 网关必须使用 HTTPS");
-    const std::string authorization = std::string("Bearer ") + CONFIG_MINI_BOT_OV_API_KEY;
-    OvHttpReply reply;
-    reply.limit = reply_limit;
-    esp_http_client_config_t config{};
-    config.url = url.c_str();
-    config.method = method;
-    config.timeout_ms = timeout_ms;
-    // 仅信任随固件分发的网关证书，保留 TLS 的主机名/IP 校验，不转发凭据到重定向地址。
-    config.disable_auto_redirect = true;
-    config.cert_pem = ov_gateway_cert_pem_start;
-    config.user_data = &reply;
-    config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
-        if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
-        auto& response = *static_cast<OvHttpReply*>(event->user_data);
-        if (response.too_large) return ESP_OK;
-        const auto length = static_cast<size_t>(event->data_len);
-        if (length > response.limit - response.body.size()) {
-            response.too_large = true;
-            return ESP_OK;
-        }
-        response.body.append(static_cast<const char*>(event->data), length);
-        return ESP_OK;
-    };
-    std::unique_ptr<esp_http_client, decltype(&esp_http_client_cleanup)> client(
-        esp_http_client_init(&config), esp_http_client_cleanup);
-    if (!client) return std::unexpected("创建 OV HTTP 客户端失败");
-    if ((!content_type.empty() && esp_http_client_set_header(client.get(), "Content-Type", content_type.data()) != ESP_OK) ||
-        esp_http_client_set_header(client.get(), "Authorization", authorization.c_str()) != ESP_OK ||
-        (!body.empty() && (body.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-                          esp_http_client_set_post_field(client.get(), body.data(), static_cast<int>(body.size())) != ESP_OK))) {
-        return std::unexpected("设置 OV HTTP 请求失败");
-    }
-    const auto err = esp_http_client_perform(client.get());
-    if (err != ESP_OK) return std::unexpected(esp_err_to_name(err));
-    if (reply.too_large) return std::unexpected("OV HTTP 响应超过内存限制");
-    reply.status = esp_http_client_get_status_code(client.get());
-    return reply;
-}
 
 void LogWatchHeap() {
     constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
@@ -237,10 +181,12 @@ void OvCameraWatcher::TaskEntry(void* arg) {
 }
 
 void OvCameraWatcher::RunLoop() {
+    // 整个观察任务共享一个客户端；Stop 只通知退出，不跨线程关闭连接。
+    OvHttpClient http(base_url_);
     // get_view 可在建会话期间到达，建会话和首帧也计入它的等待上限。
     constexpr int kMaxFailures = 5;
     for (int attempt = 1; watching_; ++attempt) {
-        auto result = OpenSession();
+        auto result = OpenSession(http);
         if (result) {
             // 只等首次建会话完成，不等持续观察本身结束。
             starting_ = false;
@@ -278,8 +224,8 @@ void OvCameraWatcher::RunLoop() {
         // 不确定网关是否已收到的提问仍可能迟到。先换会话，再接新问题。
         if ((active && active != requested) || stream_lost) {
             stream_lost = false;
-            CloseSession();
-            if (!watching_ || !OpenSession()) {
+            CloseSession(http);
+            if (!watching_ || !OpenSession(http)) {
                 watching_ = false;
                 break;
             }
@@ -299,7 +245,7 @@ void OvCameraWatcher::RunLoop() {
                 active = requested;
             }
             match = {question_t};
-            if (auto r = SendQuestion(active->question, match.question_t, active->time_scope); !r) {
+            if (auto r = SendQuestion(http, active->question, match.question_t, active->time_scope); !r) {
                 // 保留 active，等待线程收到错误后，下一次循环隔离旧会话。
                 FinishView(active, "发送画面问题失败：" + r.error(), "");
             }
@@ -307,7 +253,7 @@ void OvCameraWatcher::RunLoop() {
         };
         const auto poll = [&] {
             if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;
-            auto answer = CollectResults(result_after, match);
+            auto answer = CollectResults(http, result_after, match);
             next_poll_us = esp_timer_get_time() + kPollIntervalUs;
             if (!answer) {
                 ESP_LOGW(kTag, "OV 拉取结果失败: %s", answer.error().c_str());
@@ -335,7 +281,7 @@ void OvCameraWatcher::RunLoop() {
         }
         if (watching_ && !stream_lost && esp_timer_get_time() >= next_frame_us) {
             next_frame_us = esp_timer_get_time() + kFrameIntervalMs * 1000LL;
-            auto frame = PushOneFrame(start_us);
+            auto frame = PushOneFrame(http, start_us);
             if (!frame) {
                 ESP_LOGW(kTag, "本轮失败: %s", frame.error().c_str());
                 if (frame.error() == kSessionExpired) {
@@ -364,16 +310,15 @@ void OvCameraWatcher::RunLoop() {
     ESP_LOGI(kTag, "观察任务退出");
     // 任务自己负责关会话：它最清楚本轮 HTTP 是否已经结束。
     // 若交给 Stop() 关，Stop 可能在任务还在用这个会话时就把会话删了，
-    // 导致任务下一轮拿无效 session 推帧。CloseSession 是幂等的，
-    // 两边都调也安全（sid 为空时直接返回）。
-    CloseSession();
+    // 导致任务下一轮拿无效 session 推帧。关会话后局部客户端随任务释放。
+    CloseSession(http);
 }
 
-std::expected<void, std::string> OvCameraWatcher::OpenSession() {
+std::expected<void, std::string> OvCameraWatcher::OpenSession(OvHttpClient& http) {
     // 实际摄像头帧率与每秒一次的上传节拍不是同一个概念。
     // 只发送公开参数，历史保留策略由网关决定。
     constexpr auto payload = R"({"input_mode":"live","mode":"qa","fps":30.0})";
-    auto response = RequestOv(base_url_ + "/v1/glasses/sessions", HTTP_METHOD_POST,
+    auto response = http.Request("/v1/glasses/sessions", HTTP_METHOD_POST,
                               kHttpTimeoutMs, kMaxControlReplyBytes, "application/json", payload);
     if (!response) return std::unexpected("连接网关失败: " + response.error());
     if (response->status != 201) {
@@ -394,14 +339,14 @@ std::expected<void, std::string> OvCameraWatcher::OpenSession() {
         session_id_ = sid;
     }
     if (TextField(root.get(), "mode") != "qa") {
-        CloseSession();
+        CloseSession(http);
         return std::unexpected("OV 未建立 QA 会话");
     }
     ESP_LOGI(kTag, "会话已建立: %s (qa, fps=30)", sid.c_str());
     return {};
 }
 
-void OvCameraWatcher::CloseSession() {
+void OvCameraWatcher::CloseSession(OvHttpClient& http) {
     std::string sid;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -409,7 +354,8 @@ void OvCameraWatcher::CloseSession() {
     }
     if (sid.empty()) return;
 
-    auto response = RequestOv(base_url_ + "/v1/glasses/sessions/" + sid, HTTP_METHOD_DELETE, 3000);
+    auto response = http.Request("/v1/glasses/sessions/" + sid, HTTP_METHOD_DELETE,
+                                 3000, kMaxControlReplyBytes);
     if (!response || response->status < 200 || response->status >= 300) {
         ESP_LOGW(kTag, "OV 会话关闭未确认: %s",
                  (response ? std::to_string(response->status) : response.error()).c_str());
@@ -501,7 +447,7 @@ bool OvCameraWatcher::FinishView(const std::shared_ptr<ViewRequest>& request, co
     return true;
 }
 
-std::expected<void, std::string> OvCameraWatcher::SendQuestion(const std::string& question, double t_sec,
+std::expected<void, std::string> OvCameraWatcher::SendQuestion(OvHttpClient& http, const std::string& question, double t_sec,
                                                               const std::string& time_scope) {
     std::string sid;
     {
@@ -522,7 +468,7 @@ std::expected<void, std::string> OvCameraWatcher::SendQuestion(const std::string
     if (!printed) return std::unexpected("生成观察提示词 JSON 失败");
     std::unique_ptr<char, decltype(&cJSON_free)> body(printed, cJSON_free);
     ESP_LOGI(kTag, "OV question sent t=%.6f scope=%s", t_sec, time_scope.c_str());
-    auto response = RequestOv(base_url_ + "/v1/glasses/sessions/" + sid + "/text", HTTP_METHOD_POST,
+    auto response = http.Request("/v1/glasses/sessions/" + sid + "/text", HTTP_METHOD_POST,
                               kHttpTimeoutMs, kMaxControlReplyBytes, "application/json", body.get());
     if (!response) return std::unexpected(response.error());
     if (response->status != 200) {
@@ -536,7 +482,7 @@ std::expected<void, std::string> OvCameraWatcher::SendQuestion(const std::string
     return {};
 }
 
-std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(int64_t session_start_us) {
+std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(OvHttpClient& http, int64_t session_start_us) {
     std::string sid;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -544,7 +490,7 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     }
     if (sid.empty()) return std::unexpected("没有有效会话");
 
-    const std::string session_path = base_url_ + "/v1/glasses/sessions/" + sid;
+    const std::string session_path = "/v1/glasses/sessions/" + sid;
 
     auto frame = CaptureFreshFrame();
     if (!frame) return std::unexpected(frame.error());
@@ -552,7 +498,7 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     char path[48];
     snprintf(path, sizeof(path), "/frame?t=%.6f", t_sec);
 
-    auto response = RequestOv(session_path + path, HTTP_METHOD_POST, kHttpTimeoutMs,
+    auto response = http.Request(session_path + path, HTTP_METHOD_POST, kHttpTimeoutMs,
                               kMaxControlReplyBytes, "image/jpeg", frame->jpeg);
     if (!response) return std::unexpected("推帧失败: " + response.error());
     if (response->status == 404) return std::unexpected(kSessionExpired);
@@ -571,14 +517,14 @@ std::expected<std::optional<double>, std::string> OvCameraWatcher::PushOneFrame(
     return std::unexpected("OV 推帧响应缺少 accepted");
 }
 
-std::expected<std::string, std::string> OvCameraWatcher::CollectResults(int& after, AnswerMatch& match) {
+std::expected<std::string, std::string> OvCameraWatcher::CollectResults(OvHttpClient& http, int& after, AnswerMatch& match) {
     std::string sid;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         sid = session_id_;
     }
     if (sid.empty()) return std::unexpected("没有有效的 QA 会话");
-    auto response = RequestOv(base_url_ + "/v1/glasses/sessions/" + sid +
+    auto response = http.Request("/v1/glasses/sessions/" + sid +
                               "/results?after=" + std::to_string(after) + "&wait=0", HTTP_METHOD_GET,
                               kResultReadTimeoutMs, kMaxResultReplyBytes);
     if (!response) return std::unexpected(response.error());

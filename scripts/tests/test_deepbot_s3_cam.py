@@ -941,30 +941,30 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         loop = source.split('void OvCameraWatcher::RunLoop() {', 1)[1].split('\n}', 1)[0]
         setup, frames = loop.split('while (watching_)', 1)
         self.assertNotIn('SendQuestion(', setup)
-        self.assertIn('PushOneFrame(start_us)', frames)
+        self.assertIn('PushOneFrame(http, start_us)', frames)
         upload = source.split('OvCameraWatcher::PushOneFrame(', 1)[1].split('\n}', 1)[0]
         self.assertIn('CaptureFreshFrame()', upload)
         self.assertIn('frame->captured_us - session_start_us', upload)
         self.assertIn('if (cJSON_IsTrue(accepted)) return t_sec;', upload)
         capture = source.split('OvCameraWatcher::CaptureFreshFrame()', 1)[1]
         self.assertIn('if (timestamp < requested_us) continue;', capture)
-        open_session = source.split('OvCameraWatcher::OpenSession()', 1)[1].split('\n}', 1)[0]
+        open_session = source.split('OvCameraWatcher::OpenSession(', 1)[1].split('\n}', 1)[0]
         payload = re.search(r'constexpr auto payload = R"\((\{[^\n]*\})\)";', open_session)
         self.assertIsNotNone(payload)
         config = json.loads(payload.group(1))
         self.assertEqual((config['input_mode'], config['mode'], config['fps']), ('live', 'qa', 30.0))
         self.assertEqual(set(config), {'input_mode', 'mode', 'fps'})
         self.assertEqual(source.count('SendQuestion('), 2)  # 定义和 look / get_view 共用调用点
-        self.assertIn('SendQuestion(active->question, match.question_t, active->time_scope)', frames)
+        self.assertIn('SendQuestion(http, active->question, match.question_t, active->time_scope)', frames)
         self.assertIn('cJSON_AddStringToObject(root, "time_scope", time_scope.c_str())', source)
         self.assertIn('if (!watching_ || std::chrono::steady_clock::now() >= active->deadline) return;', frames)
-        self.assertIn('CollectResults(result_after, match)', frames)
+        self.assertIn('CollectResults(http, result_after, match)', frames)
         self.assertIn('question_t - frame_t >= kCurrentFrameMaxAgeSec', frames)
-        self.assertLess(frames.index('if (!active && wants_current && latest_frame)'), frames.index('PushOneFrame(start_us)'))
+        self.assertLess(frames.index('if (!active && wants_current && latest_frame)'), frames.index('PushOneFrame(http, start_us)'))
         self.assertIn('if ((active && active != requested) || stream_lost)', frames)
         # 流式会话失效后必须重建会话，否则同一会话的回看会一直失败。
         self.assertIn('stream_lost = match.status == "stream_unavailable";', frames)
-        self.assertIn('CloseSession();', frames)
+        self.assertIn('CloseSession(http);', frames)
         board = SOURCE.read_text()
         # 只留两个 look 供模型调用；串口问答不受影响。
         self.assertNotIn('"self.camera.get_view"', board)
@@ -1010,13 +1010,12 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
 
         # 推帧必须声明为 JPEG 并发送裸字节，不读取其他请求的同名调用。
         self.assertIn('kMaxControlReplyBytes, "image/jpeg", frame->jpeg', upload)
-        self.assertIn('esp_http_client_set_post_field(client.get(), body.data(), static_cast<int>(body.size()))', source)
 
         # 插话内容用 cJSON 构造，避免文本里的引号产生非法 JSON
         self.assertIn('cJSON_AddStringToObject(root, "text"', source)
 
         # 会话必须被关闭，避免网关侧会话堆积
-        self.assertIn("CloseSession()", source)
+        self.assertIn("CloseSession(http)", source)
 
         # 公开接口使用已处理的 seq；不依赖旧网关的诊断通道。
         collect = source.split('OvCameraWatcher::CollectResults(', 1)[1].split('\n}', 1)[0]
@@ -1024,20 +1023,9 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         for private_field in ('/logs?', 'X-Session-Log-Token', 'task_template', 'question_log_seq'):
             self.assertNotIn(private_field, source)
 
-    def test_ov_uses_verified_https_with_bounded_response_and_diagnostics(self):
+    def test_ov_logs_observation_memory_and_reset_reason(self):
         source = (ROOT / "main/boards/common/ov_camera_watcher.cc").read_text()
-        http = source.split("std::expected<OvHttpReply, std::string> RequestOv(", 1)[1].split("void LogWatchHeap()", 1)[0]
         self.assertNotIn("CreateHttp(", source)
-        self.assertIn("config.disable_auto_redirect = true;", http)
-        self.assertIn('if (!url.starts_with("https://"))', http)
-        self.assertIn('config.cert_pem = ov_gateway_cert_pem_start;', http)
-        self.assertIn('"Authorization", authorization.c_str()', http)
-        self.assertNotIn('skip_cert_common_name_check', http)
-        self.assertNotIn('crt_bundle_attach', http)
-        self.assertIn("esp_http_client_init(&config), esp_http_client_cleanup", http)
-        self.assertLess(http.index("length > response.limit - response.body.size()"), http.index("response.body.append("))
-        self.assertIn("esp_http_client_perform(client.get())", http)
-        self.assertIn("if (reply.too_large) return std::unexpected", http)
         self.assertIn("kHeapLogIntervalUs = 30000000", source)
         self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", source)
         self.assertIn("heap_caps_get_largest_free_block(internal)", source)
