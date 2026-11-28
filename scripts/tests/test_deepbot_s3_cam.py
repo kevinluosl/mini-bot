@@ -939,7 +939,7 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         for path in ("/v1/glasses/sessions", "/text", "/frame?t=", "/results?after=", "DELETE"):
             self.assertIn(path, source)
 
-        # 检查运行路径而非函数定义的排列；启用阶段结束后不得重建会话或重新提问。
+        # 启用阶段只建会话；开始推帧后才允许看图或提交监控条件。
         loop = source.split('void OvCameraWatcher::RunLoop() {', 1)[1].split('\n}', 1)[0]
         setup, frames = loop.split('while (watching_)', 1)
         self.assertNotIn('SendQuestion(', setup)
@@ -956,14 +956,15 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         config = json.loads(payload.group(1))
         self.assertEqual((config['input_mode'], config['mode'], config['fps']), ('live', 'qa', 30.0))
         self.assertEqual(set(config), {'input_mode', 'mode', 'fps'})
-        self.assertEqual(source.count('SendQuestion('), 4)  # 定义、用户查询、恢复检查和持续提醒
-        self.assertIn('SendQuestion(http, prompt, t, "auto")', frames)
+        self.assertEqual(source.count('SendQuestion('), 3)  # 定义、用户查询和共用的监控提交入口
+        self.assertIn('SendQuestion(http, monitor.condition, t, "auto")', frames)
+        self.assertNotIn('CLEARED', frames)
         self.assertIn('SendQuestion(http, active->question, match.question_t, active->time_scope)', frames)
         self.assertIn('cJSON_AddStringToObject(root, "time_scope", time_scope.c_str())', source)
         self.assertIn('if (!watching_ || (active && !has_query && !query_abandoned)) return;', frames)
         self.assertIn('CollectResults(http, result_after, match)', frames)
         self.assertIn('question_t - frame_t >= kCurrentFrameMaxAgeSec', frames)
-        self.assertLess(frames.index('if (!active && !confirm_by_us && !clear_check_by_us && wants_current && latest_frame)'),
+        self.assertLess(frames.index('if (!stream_lost && !active && !confirm_by_us && wants_current && latest_frame)'),
                         frames.index('PushOneFrame(http, start_us)'))
         self.assertIn('if ((query_abandoned && (monitor.condition.empty() || now_us >= abandoned_query_until_us)) || stream_lost)', frames)
         # 流式会话失效后必须重建会话，否则同一会话的回看会一直失败。
@@ -978,9 +979,16 @@ class DeepbotS3CamBoardTests(unittest.TestCase):
         self.assertIn('PropertyList()', start_watch)
         self.assertIn('camera_->Start()', start_watch)
         self.assertNotIn('notifications/camera/watch', start_watch)
-        self.assertIn('"self.camera.start_monitor"', board)
+        start_monitor = board.split('"self.camera.start_monitor"', 1)[1].split('"self.camera.stop_monitor"', 1)[0]
+        self.assertIn('PropertyList({Property("condition", kPropertyTypeString),', start_monitor)
+        self.assertIn('Property("reminder", kPropertyTypeString, std::string{}).SetMaxLength(2048)', start_monitor)
+        self.assertIn('args["reminder"].value<std::string>()', start_monitor)
+        self.assertIn('cJSON_AddStringToObject(params, "reminder", settings.reminder.c_str())', source)
+        self.assertNotIn('monitor.reminder', frames)  # 循环只将 condition 发给 OV。
+        self.assertNotIn('silent_if_negative', start_monitor)
         self.assertIn('"self.camera.stop_monitor"', board)
         self.assertIn('"monitor_ready"', board)
+        self.assertIn('cJSON_AddStringToObject(camera, "monitor_reminder", monitor.reminder.c_str())', board)
         self.assertNotIn('Property("prompt"', start_watch)
         self.assertNotIn('camera_->Start()', ov)
         self.assertNotIn('CaptureJpeg()', ov)

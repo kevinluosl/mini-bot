@@ -315,13 +315,16 @@ private:
 
         mcp.AddTool(std::make_unique<McpTool>("self.camera.start_monitor",
             "用户说‘看到某情况时提醒我’才开启持续监控提醒；不是问当前或过去。自动开启上传画面，"
-            "只在命中后提醒，直到用 stop_monitor 停用；不要创建周期定时任务。默认启用否定静默。",
+            "condition 原样发给视觉网关；语音只写‘看到什么情况，就提醒’，不要添加建议或播报内容。"
+            "用户明确指定怎么提醒时，将其原话单独写入 reminder；这段文字只在命中后用于播报。"
+            "视觉网关每次命中后，会先等网关接收新画面，再用原条件恢复监控，不用再次启用。"
+            "用户说‘取消提醒’用 stop_monitor；不要创建周期定时任务。",
             PropertyList({Property("condition", kPropertyTypeString),
-                          Property("silent_if_negative", kPropertyTypeBoolean, true)}),
+                          Property("reminder", kPropertyTypeString, std::string{}).SetMaxLength(2048)}),
             [this](const PropertyList& args) -> ToolResult {
                 if (!camera_ || !camera_ready_) return std::unexpected("摄像头未就绪");
                 auto result = camera_->StartMonitor(args["condition"].value<std::string>(),
-                                                    args["silent_if_negative"].value<bool>());
+                                                    args["reminder"].value<std::string>());
                 if (!result) return std::unexpected(result.error());
                 return ReturnValue(std::string("已请求启用监控提醒，等待网关确认；尚未检测到目标。"));
             }));
@@ -1186,7 +1189,8 @@ public:
         cJSON_AddBoolToObject(camera, "monitor_enabled", watching && !monitor.condition.empty());
         cJSON_AddBoolToObject(camera, "monitor_ready", watching && monitor.ready);
         cJSON_AddStringToObject(camera, "monitor_condition", monitor.condition.c_str());
-        cJSON_AddBoolToObject(camera, "silent_if_negative", monitor.silent_if_negative);
+        // 回显当前规则的播报内容，和提醒条件分离。
+        cJSON_AddStringToObject(camera, "monitor_reminder", monitor.reminder.c_str());
         auto json = std::unique_ptr<char, decltype(&cJSON_free)>(cJSON_PrintUnformatted(root.get()), cJSON_free);
         return json ? std::string(json.get()) : base;
     }

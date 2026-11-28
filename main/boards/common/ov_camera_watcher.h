@@ -34,11 +34,11 @@ public:
     bool IsReady() const { return initialized_; }
 
     std::expected<void, std::string> Start();
-    std::expected<void, std::string> StartMonitor(const std::string& condition, bool silent_if_negative);
+    std::expected<void, std::string> StartMonitor(const std::string& condition, const std::string& reminder = {});
     void StopMonitor();
     struct MonitorStatus {
         std::string condition;
-        bool silent_if_negative = true;
+        std::string reminder;  // 可选的用户播报要求；不发送给 OV。
         bool ready = false;
     };
     MonitorStatus GetMonitorStatus() const;

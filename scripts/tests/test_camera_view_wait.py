@@ -216,6 +216,7 @@ int main() {
 #define ESP_LOGI(...) ((void)0)
 #define pdMS_TO_TICKS(ms) (ms)
 constexpr int kFrameIntervalMs = 1000;
+constexpr unsigned kMonitorRearmFreshFrames = 3;
 constexpr double kCurrentFrameMaxAgeSec = 2.0;
 constexpr const char* kSessionExpired = "closed";
 constexpr int kViewTimeoutSec = 20;
@@ -247,13 +248,16 @@ struct OvCameraWatcher {
         bool query_pending, monitor_registering, monitor_accepted;
         std::vector<std::pair<int, std::string>> reports;
     };
-    struct MonitorStatus { std::string condition; bool ready = false; } monitor_;
+    struct MonitorStatus { std::string condition, reminder; bool ready = false; } monitor_;
     std::mutex monitor_mutex_, session_mutex_;
     std::atomic<uint32_t> monitor_revision_{0};
     std::string session_id_ = "fixture";
     MonitorStatus GetMonitorStatus() { return monitor_; }
-    void PublishMonitorEvent(const std::string&, int seq, const std::string& text, const MonitorStatus&) {
+    bool stop_on_hit = false;
+    void PublishMonitorEvent(const std::string&, int seq, const std::string& text, const MonitorStatus& settings) {
+        if (seq) delivered_reminders.push_back(settings.reminder);
         events.push_back(seq ? "report:" + text : "monitor:stop");
+        if (seq && stop_on_hit) { monitor_ = {}; ++monitor_revision_; }
     }
     bool ClearWatch(OvHttpClient&) { events.push_back("clear"); return true; }
     bool watching_ = true;
@@ -261,12 +265,16 @@ struct OvCameraWatcher {
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
     std::shared_ptr<ViewRequest> pending_;
-    std::vector<std::string> events;
+    std::vector<std::string> events, delivered_reminders;
     unsigned frames = 0, polls = 0;
     double capture_t = 0;
     bool current = false, inject_current = true, stale_current = false, cancel_answer = false, mode_monitor = false;
-    bool internal_check = false, stick_wait = false, missing_look = false;
-    unsigned recovery_checks = 0, session_opens = 0;
+    bool missing_look = false, recovered_look = false;
+    enum class Setup { kAccept, kNoAck, kPostFails };
+    Setup setup = Setup::kAccept;
+    unsigned monitor_posts = 0, session_opens = 0;
+    unsigned frames_after_hit = 0;
+    std::string first_monitor_prompt;
     int64_t second_open_at = 0;
     unsigned fast_polls = 0;
     void WaitForWork(const std::shared_ptr<ViewRequest>& snapshot, int64_t wake_us, const uint32_t*) {
@@ -302,10 +310,20 @@ struct OvCameraWatcher {
         if (mode_monitor) {
             if (missing_look) {
                 if (frames == 13) watching_ = false;
+                if (session_opens == 2 && !recovered_look) {
+                    recovered_look = true;
+                    pending_ = std::make_shared<ViewRequest>(ViewRequest{"question", std::chrono::steady_clock::time_point::max(), "current"});
+                }
+            } else if (setup != Setup::kAccept) {
+                if (frames == 27) watching_ = false;
             } else {
-                if (frames == (stick_wait ? 24u : 16u)) { monitor_.condition.clear(); ++monitor_revision_; }
-                if (frames == (stick_wait ? 26u : 18u)) watching_ = false;
+                if (frames == 25) { monitor_.condition.clear(); ++monitor_revision_; }
+                if (frames == 27) { monitor_.condition = " 看到有人举手，就提醒我看过去。 "; ++monitor_revision_; }
+                if (frames == 30) watching_ = false;
             }
+            if (polls && ++frames_after_hit == 1) return {true, std::nullopt}; // HTTP 200，OV 跳过。
+            if (polls && frames_after_hit == 2) return {true, capture_t - 3}; // 假设接受了晚到的旧帧。
+            if (polls && frames_after_hit > 2) events.push_back("monitor:fresh");
             return {true, capture_t};
         }
         if (current) {
@@ -325,12 +343,15 @@ struct OvCameraWatcher {
     Result<int> SendQuestion(OvHttpClient& http, const std::string& question, double t, const std::string& scope) { assert(transport == &http);
         events.push_back("ask");
         if (mode_monitor && scope == "auto") {
-            assert(question.find("举手") != std::string::npos);
-            return {true};
+            assert(question == " 看到有人举手，就提醒我看过去。 ");
+            if (!monitor_posts) first_monitor_prompt = question;
+            assert(question == first_monitor_prompt);
+            ++monitor_posts;
+            events.push_back("monitor:post");
+            return {setup != Setup::kPostFails};
         }
         if (mode_monitor) {
-            assert(scope == "current");
-            internal_check = question.find("CLEARED") != std::string::npos;
+            assert(scope == "current" && question == "question");  // 禁止额外发恢复检查。
             return {true};
         }
         // 采样任务把请求里的 time_scope 原样交给网关。
@@ -346,17 +367,11 @@ struct OvCameraWatcher {
         ++after;
         if (mode_monitor) {
             if (match.monitor_registering) {
+                if (setup == Setup::kNoAck) return {true, ""};
                 events.push_back("accepted"); match.monitor_accepted = true;
-                if (frames == 1 || (missing_look && session_opens == 2)) {
+                if (frames == 1) {
                     pending_ = std::make_shared<ViewRequest>(ViewRequest{"question", std::chrono::steady_clock::time_point::max(), "current"});
                 }
-            } else if (internal_check) {
-                assert(match.query_pending);
-                internal_check = false;
-                match.status = "ok";
-                const bool cleared = ++recovery_checks != 1 && !stick_wait;
-                events.push_back(cleared ? "recovered" : "still-present");
-                return {true, cleared ? "CLEARED" : "WAIT"};
             } else if (match.query_pending) {
                 if (missing_look) {
                     if (session_opens == 1) {
@@ -372,11 +387,14 @@ struct OvCameraWatcher {
                     return {true, ""};
                 }
                 match.status = "ok";
+                frames_after_hit = 0;
                 match.reports.emplace_back(after - 1, "命中");
                 ++polls;
                 return {true, "late look"};
-            } else if (polls == 1 && frames >= 4) {
-                match.reports.emplace_back(after, "再次命中");
+            } else if (monitor_posts == 2 && polls == 1 && frames >= 4 && frames < 25) {
+                // 真网关首条命中后移除规则；只有收到下一次 POST 才能再命中。
+                frames_after_hit = 0;
+                match.reports.emplace_back(after, "命中");
                 ++polls;
             }
             return {true, ""};
@@ -445,36 +463,62 @@ int main() {
     now_us = 0;
     OvCameraWatcher monitored;
     monitored.mode_monitor = true;
-    monitored.monitor_.condition = "举手";
+    monitored.monitor_.condition = " 看到有人举手，就提醒我看过去。 ";
+    monitored.monitor_.reminder = "请看向举手的人";
     monitored.RunLoop();
-    for (const auto& item : {"report:命中", "report:再次命中", "abandoned-look", "monitor:stop", "clear", "frame18"}) {
+    assert((monitored.delivered_reminders == std::vector<std::string>{"请看向举手的人", "请看向举手的人"}));
+    for (const auto& item : {"report:命中", "abandoned-look", "monitor:stop", "clear", "frame30"}) {
         assert(std::count(monitored.events.begin(), monitored.events.end(), item) >= 1);
     }
+    assert(monitored.polls == 2);
+    assert(std::count(monitored.events.begin(), monitored.events.end(), "report:命中") == 2);
     assert(std::count(monitored.events.begin(), monitored.events.end(), "open") == 1);
     assert(std::count(monitored.events.begin(), monitored.events.end(), "close") == 1);
-    assert(std::count(monitored.events.begin(), monitored.events.end(), "report:恢复") == 0);
-    const auto still_present = std::find(monitored.events.begin(), monitored.events.end(), "still-present");
-    const auto recovered = std::find(monitored.events.begin(), monitored.events.end(), "recovered");
-    assert(still_present < recovered);
-    assert(std::find(still_present + 1, recovered, "accepted") == recovered);
     assert(std::count(monitored.events.begin(), monitored.events.end(), "late look") == 0);
-    // 真网关可能反复给 WAIT。退避有上限，不能因这个分类结果永久停在第一次提醒。
+    // 首次启用 + 两次命中各补发一次 + 用户明确重新启用一次。
+    assert(monitored.monitor_posts == 4);
+    const auto cleared = std::find(monitored.events.begin(), monitored.events.end(), "clear");
+    assert(std::count(monitored.events.begin(), cleared, "accepted") == 3);
+    assert(std::count(cleared, monitored.events.end(), "accepted") == 1);
+    for (auto it = monitored.events.begin(); it != monitored.events.end(); ++it) {
+        if (*it == "report:命中") {
+            // 被跳过的帧和命中前采集的帧都不算；收到三张新帧就重设，不等播报。
+            const auto post = std::find(it + 1, cleared, "monitor:post");
+            assert(post != cleared);
+            assert(std::count(it + 1, post, "monitor:fresh") == kMonitorRearmFreshFrames);
+        }
+    }
     now_us = 0;
-    OvCameraWatcher uncertain;
-    uncertain.mode_monitor = uncertain.stick_wait = true;
-    uncertain.monitor_.condition = "举手";
-    uncertain.RunLoop();
-    assert(std::count(uncertain.events.begin(), uncertain.events.end(), "report:再次命中") == 1);
-    assert(std::count(uncertain.events.begin(), uncertain.events.end(), "open") == 1);
-    // 看图永不回包时，监控开关保留；只在有界等待后重建，后续看图不被卡死。
+    OvCameraWatcher stopped;
+    stopped.mode_monitor = stopped.stop_on_hit = true;
+    stopped.monitor_.condition = " 看到有人举手，就提醒我看过去。 ";
+    stopped.RunLoop();
+    // 上报时并发停用，不重发；下一次 POST 只来自手动重新启用。
+    assert(stopped.monitor_posts == 2);
+    const auto stop = std::find(stopped.events.begin(), stopped.events.end(), "monitor:stop");
+    assert(std::count(stopped.events.begin(), stop, "monitor:post") == 1);
+    assert(std::count(stopped.events.begin(), stopped.events.end(), "report:命中") == 1);
+    for (const auto setup : {OvCameraWatcher::Setup::kNoAck, OvCameraWatcher::Setup::kPostFails}) {
+        now_us = 0;
+        OvCameraWatcher unconfirmed;
+        unconfirmed.mode_monitor = true;
+        unconfirmed.setup = setup;
+        unconfirmed.monitor_.condition = " 看到有人举手，就提醒我看过去。 ";
+        unconfirmed.RunLoop();
+        assert(unconfirmed.monitor_posts == 1);
+        assert(unconfirmed.session_opens == 2 && unconfirmed.monitor_.condition.empty());
+        assert(!unconfirmed.monitor_.ready);
+    }
+    // 看图永不回包时，有界等待后恢复看图会话，但不能重发旧监控条件。
     now_us = 0;
     OvCameraWatcher missing;
     missing.mode_monitor = missing.missing_look = true;
-    missing.monitor_.condition = "举手";
+    missing.monitor_.condition = " 看到有人举手，就提醒我看过去。 ";
     missing.RunLoop();
     assert(missing.session_opens == 2 && missing.second_open_at >= 6000000);
-    assert(missing.monitor_.condition == "举手");
-    assert(std::count(missing.events.begin(), missing.events.end(), "accepted") == 2);
+    assert(missing.monitor_.condition.empty() && !missing.monitor_.ready);
+    assert(missing.monitor_posts == 1);
+    assert(std::count(missing.events.begin(), missing.events.end(), "accepted") == 1);
     assert(std::count(missing.events.begin(), missing.events.end(), "answer") == 1);
     for (bool before_first_frame : {false, true}) {
         now_us = 0;
